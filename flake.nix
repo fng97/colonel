@@ -1,5 +1,5 @@
 {
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05";
 
   outputs = { nixpkgs, ... }:
     let
@@ -10,8 +10,13 @@
         (system: f { pkgs = import nixpkgs { inherit system; }; });
     in {
       devShells = forEachSupportedSystem ({ pkgs }: {
-        default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
-          packages = with pkgs; [ qemu llvmPackages.bintools-unwrapped ];
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            zig
+            zls
+            qemu
+            llvmPackages.bintools-unwrapped
+          ];
         };
       });
     };
