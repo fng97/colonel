@@ -3,6 +3,8 @@
 // Some inline assembly is used. The docs are here:
 // https://ziglang.org/documentation/master/#toc-Assembly
 
+const std = @import("std");
+
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
@@ -11,8 +13,8 @@ export fn kernel_main() noreturn {
     // Ensure the bss section is cleared to zero.
     @memset(bss[0 .. bss_end - bss], 0);
 
-    const hello = "Hello Kernel!\n";
-    for (hello) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
+    console.print("\n\nHello {s}\n", .{"World!"}) catch {};
+    console.print("1 + 2 = {d}, {x}\n", .{ 1 + 2, 0x1234abcd }) catch {};
 
     while (true) asm volatile ("");
 }
@@ -31,6 +33,8 @@ const SbiRet = struct {
     value: usize,
 };
 
+/// Perform an Environment Call (ECAll) using the Supervisor Binary Interface (SBI). This is used
+/// to implement a syscall: a call from user mode to execute higher privileged code.
 pub fn sbi_call(
     arg0: usize,
     arg1: usize,
@@ -59,4 +63,14 @@ pub fn sbi_call(
     );
 
     return .{ .err = err, .value = value };
+}
+
+const console: std.io.AnyWriter = .{
+    .context = undefined,
+    .writeFn = write_fn,
+};
+
+fn write_fn(_: *const anyopaque, bytes: []const u8) !usize {
+    for (bytes) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
+    return bytes.len;
 }
