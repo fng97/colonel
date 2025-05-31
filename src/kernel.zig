@@ -16,6 +16,20 @@ export fn kernel_main() noreturn {
     console.print("\n\nHello {s}\n", .{"World!"}) catch {};
     console.print("1 + 2 = {d}, {x}\n", .{ 1 + 2, 0x1234abcd }) catch {};
 
+    @panic("Booted! Panic!\n");
+
+    // while (true) asm volatile ("");
+}
+
+pub fn panic(
+    msg: []const u8,
+    error_return_trace: ?*std.builtin.StackTrace,
+    ret_addr: ?usize,
+) noreturn {
+    _ = error_return_trace;
+    _ = ret_addr;
+
+    console.print("PANIC: {s}\n", .{msg}) catch {};
     while (true) asm volatile ("");
 }
 
