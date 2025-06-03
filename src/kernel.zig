@@ -4,7 +4,8 @@
 // https://ziglang.org/documentation/master/#toc-Assembly
 
 // TODO:
-// - get assertions working
+// - Get assertions working (we're using ReleaseSmall).
+// - Unreachable should print something sensible? I assume it doesn't because we've redefined panic.
 
 const std = @import("std");
 
@@ -14,23 +15,30 @@ const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
 const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
 
-export fn kernel_main() noreturn {
+/// The kernel main function.
+fn main() !void {
     // Ensure the bss section is cleared to zero.
     @memset(bss[0 .. bss_end - bss], 0);
 
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
-    console.print("\n\nHello {s}\n", .{"World!"}) catch {};
+    try console.print("\n\nHello {s}\n", .{"World!"});
 
     const paddr0 = alloc_pages(2);
     const paddr1 = alloc_pages(1);
 
-    console.print("alloc_pages test: paddr0={x}\n", .{@intFromPtr(paddr0.ptr)}) catch {};
-    console.print("alloc_pages test: paddr1={x}\n", .{@intFromPtr(paddr1.ptr)}) catch {};
+    try console.print("alloc_pages test: paddr0={x}\n", .{@intFromPtr(paddr0.ptr)});
+    try console.print("alloc_pages test: paddr1={x}\n", .{@intFromPtr(paddr1.ptr)});
 
-    @panic("Booted!\n");
+    while (true) asm volatile ("");
+}
 
-    // while (true) asm volatile ("");
+/// The kernel main function called by boot. This just calls main. Because boot uses inline assembly
+/// to jump here and the C ABI doesn't speak Zig errors we just use this function to bridge the gap.
+/// We catch and print any errors here so that we can use `try` in main.
+export fn kernel_main() noreturn {
+    main() catch |err| std.debug.panic("{s}\n", .{@errorName(err)});
+    unreachable;
 }
 
 pub fn panic(
@@ -146,13 +154,13 @@ const TrapFrame = struct {
     sp: usize,
 };
 
-// Preserves the CPU state by saving all general-purpose registers.
-//
-// RISC-V defines 32 integer registers. The first integer register is a zero register, and the
-// remainder are general-purpose registers. The kernel allocates extra stack space to store the
-// general purpose registers in the format described by the TrapFrame structure. `handle_trap` is
-// passed a pointer to this structure and handles the exception logic The CPU state is then restored
-// and execution is resumed.
+/// Preserves the CPU state by saving all general-purpose registers.
+///
+/// RISC-V defines 32 integer registers. The first integer register is a zero register, and the
+/// remainder are general-purpose registers. The kernel allocates extra stack space to store the
+/// general purpose registers in the format described by the TrapFrame structure. `handle_trap` is
+/// passed a pointer to this structure and handles the exception logic The CPU state is then
+/// restored and execution is resumed.
 export fn kernel_entry() align(4) callconv(.Naked) void {
     asm volatile (
     // Store the original stack pointer in sscratch so that the kernel can allocate its own
