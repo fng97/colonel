@@ -3,11 +3,16 @@
 // Some inline assembly is used. The docs are here:
 // https://ziglang.org/documentation/master/#toc-Assembly
 
+// TODO:
+// - get assertions working
+
 const std = @import("std");
 
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
+const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
+const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
 
 export fn kernel_main() noreturn {
     // Ensure the bss section is cleared to zero.
@@ -16,10 +21,16 @@ export fn kernel_main() noreturn {
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
     console.print("\n\nHello {s}\n", .{"World!"}) catch {};
-    console.print("1 + 2 = {d}, {x}\n", .{ 1 + 2, 0x1234abcd }) catch {};
 
-    asm volatile ("unimp");
-    while (true) asm volatile ("");
+    const paddr0 = alloc_pages(2);
+    const paddr1 = alloc_pages(1);
+
+    console.print("alloc_pages test: paddr0={x}\n", .{@intFromPtr(paddr0.ptr)}) catch {};
+    console.print("alloc_pages test: paddr1={x}\n", .{@intFromPtr(paddr1.ptr)}) catch {};
+
+    @panic("Booted!\n");
+
+    // while (true) asm volatile ("");
 }
 
 pub fn panic(
@@ -41,6 +52,27 @@ export fn boot() linksection(".text.boot") callconv(.Naked) void {
         :
         : [stack_top] "r" (stack_top),
     );
+}
+
+var ram_used: usize = 0;
+
+/// A simple bump allocator.
+///
+/// TODO: Support freeing memory. Consider a bitmap-based algorithm or the "buddy system".
+fn alloc_pages(pages: usize) []u8 {
+    const page_size = 4096;
+    const ram: []u8 = ram_start[0 .. ram_end - ram_start];
+
+    const alloc_size = pages * page_size;
+    const ram_available = ram[ram_used..];
+
+    if (alloc_size > ram_available.len) @panic("Out of memory");
+
+    const result = ram_available[0..alloc_size];
+    @memset(result, 0);
+    ram_used += alloc_size;
+
+    return result;
 }
 
 const SbiRet = struct {
