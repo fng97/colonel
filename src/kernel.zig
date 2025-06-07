@@ -24,11 +24,19 @@ fn main() !void {
 
     try console.print("\n\nHello {s}\n", .{"World!"});
 
-    const paddr0 = alloc_pages(2);
-    const paddr1 = alloc_pages(1);
+    {
+        const page1 = alloc_pages(2);
+        const page2 = alloc_pages(1);
 
-    try console.print("alloc_pages test: paddr0={x}\n", .{@intFromPtr(paddr0.ptr)});
-    try console.print("alloc_pages test: paddr1={x}\n", .{@intFromPtr(paddr1.ptr)});
+        try console.print("alloc_pages test: page1={*} ({})\n", .{ page1.ptr, page1.len });
+        try console.print("alloc_pages test: page2={*} ({})\n", .{ page2.ptr, page2.len });
+    }
+
+    {
+        process_a = create_process(&process_a_entry);
+        process_b = create_process(&process_b_entry);
+        process_a_entry();
+    }
 
     while (true) asm volatile ("");
 }
@@ -81,6 +89,135 @@ fn alloc_pages(pages: usize) []u8 {
     ram_used += alloc_size;
 
     return result;
+}
+
+const Process = struct {
+    /// The conventional name for the process ID.
+    pid: u32,
+    state: enum { unused, runnable },
+    // TODO: Make this a usize instead of *usize.
+    /// The conventional name for the stack pointer.
+    sp: *usize,
+    /// Used to store CPU registers, return addresses (where it was called from), and local
+    /// variables between context switches.
+    stack: [8192]u8 align(4),
+};
+
+// TODO: Why does this have to be noinline?
+/// Context switch between processes. Saves the current process's registers onto the kernel-reserved
+/// space on its stack, swaps the stack pointers, then restores the next process's registers from
+/// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
+/// local variables on it's stack (Process.stack).
+noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
+    asm volatile (
+    // Allocate space for 13 4-byte registers.
+        \\addi sp, sp, -13 * 4 
+
+        // Save current process's registers.
+        \\sw ra,  0  * 4(sp)   
+        \\sw s0,  1  * 4(sp)
+        \\sw s1,  2  * 4(sp)
+        \\sw s2,  3  * 4(sp)
+        \\sw s3,  4  * 4(sp)
+        \\sw s4,  5  * 4(sp)
+        \\sw s5,  6  * 4(sp)
+        \\sw s6,  7  * 4(sp)
+        \\sw s7,  8  * 4(sp)
+        \\sw s8,  9  * 4(sp)
+        \\sw s9,  10 * 4(sp)
+        \\sw s10, 11 * 4(sp)
+        \\sw s11, 12 * 4(sp)
+
+        // Switch the stack pointer.
+        \\sw sp, (%[prev_sp]) // *prev_sp = sp
+        \\lw sp, (%[next_sp]) // sp = *next_sp
+
+        // Restore next process's registers from its stack.
+        \\lw ra,  0  * 4(sp)
+        \\lw s0,  1  * 4(sp)
+        \\lw s1,  2  * 4(sp)
+        \\lw s2,  3  * 4(sp)
+        \\lw s3,  4  * 4(sp)
+        \\lw s4,  5  * 4(sp)
+        \\lw s5,  6  * 4(sp)
+        \\lw s6,  7  * 4(sp)
+        \\lw s7,  8  * 4(sp)
+        \\lw s8,  9  * 4(sp)
+        \\lw s9,  10 * 4(sp)
+        \\lw s10, 11 * 4(sp)
+        \\lw s11, 12 * 4(sp)
+
+        // After popping the 13 4-byte registers from the next process's stack we can restore the
+        // stack pointer to where it was before yielding execution and return.
+        \\addi sp, sp, 13 * 4  
+        \\ret
+        :
+        : [prev_sp] "r" (prev_sp),
+          [next_sp] "r" (next_sp),
+    );
+}
+
+var processes = [_]Process{.{
+    .pid = 0,
+    .state = .unused,
+    .sp = undefined,
+    .stack = undefined,
+}} ** 8;
+
+fn create_process(pc: *const anyopaque) *Process {
+    const p = for (&processes, 0..) |*process, pid| {
+        if (process.state == .unused) {
+            process.pid = pid;
+            break process;
+        }
+    } else @panic("No free process slots\n");
+
+    // TODO: re-write this part to be like the book so it's more obvious what we're doing.
+    // Create zero-initialise space for the callee-saved registers on the stack.These will be
+    // restored in the first context switch (switch_context).
+
+    const regs: []usize = blk: {
+        const ptr: [*]usize = @alignCast(@ptrCast(&p.stack));
+        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
+    };
+
+    const sp = regs[regs.len - 13 ..];
+    sp[0] = @intFromPtr(pc);
+
+    std.debug.assert(sp.len == 13);
+
+    for (sp[1..]) |*reg| {
+        reg.* = 0;
+    }
+
+    p.sp = &sp.ptr[0];
+    p.state = .runnable;
+    return p;
+}
+
+var process_a: *Process = undefined;
+var process_b: *Process = undefined;
+
+fn delay() void {
+    for (0..1_000_000_000) |_| asm volatile ("nop");
+}
+
+export fn process_a_entry() void {
+    console.print("\nStarting process A\n", .{}) catch {};
+    while (true) {
+        console.print("A", .{}) catch {};
+        switch_context(&process_a.sp, &process_b.sp);
+        delay();
+    }
+}
+
+export fn process_b_entry() void {
+    console.print("\nStarting process B\n", .{}) catch {};
+    while (true) {
+        console.print("B", .{}) catch {};
+        switch_context(&process_b.sp, &process_a.sp);
+        delay();
+    }
 }
 
 const SbiRet = struct {
