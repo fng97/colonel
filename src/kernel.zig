@@ -22,7 +22,7 @@ fn main() !void {
 
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
-    try console.print("\n\nHello {s}\n", .{"World!"});
+    try console.print("\n\nHello {s}\n\n", .{"Kernel!"});
 
     {
         const page1 = alloc_pages(2);
@@ -125,6 +125,12 @@ noinline fn yield() void {
     } else process_idle;
 
     if (process_next == process_current) return;
+
+    asm volatile (
+        \\csrw sscratch, %[sscratch]
+        :
+        : [sscratch] "r" (process_next.stack[0..].ptr[process_next.stack.len - 1]),
+    );
 
     const previous = process_current;
     process_current = process_next;
@@ -327,9 +333,9 @@ const TrapFrame = struct {
 /// restored and execution is resumed.
 export fn kernel_entry() align(4) callconv(.Naked) void {
     asm volatile (
-    // Store the original stack pointer in sscratch so that the kernel can allocate its own
-    // private stack (requiring sp).
-        \\csrw sscratch, sp
+    // Store the original stack pointer in sscratch while loading the kernel stack sp previously
+    // stored in yield().
+        \\csrrw sp, sscratch, sp
 
         // Decrease the stack pointer to allocate space for the 31 general purpose registers (4
         // bytes each). The resulting address in sp will be passed to handle_trap and cast to
@@ -370,10 +376,14 @@ export fn kernel_entry() align(4) callconv(.Naked) void {
         \\sw s10, 4 * 28(sp)
         \\sw s11, 4 * 29(sp)
 
-        // Store the original sp at the end of the space we allocated (you can see it's the last
-        // item in TrapFrame).
+        // Store the original sp (at time of the exception) at the end of the space we allocated
+        // (you can see it's the last item in TrapFrame).
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
+
+        // Reset the kernel stack.
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
 
         // Call handle_trap with a pointer to the start of TrapFrame.
         \\mv a0, sp
