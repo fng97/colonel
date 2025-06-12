@@ -33,9 +33,15 @@ fn main() !void {
     }
 
     {
-        process_a = create_process(&process_a_entry);
-        process_b = create_process(&process_b_entry);
-        process_a_entry();
+        process_idle = create_process(undefined);
+        process_current = process_idle;
+
+        _ = create_process(&process_a_entry);
+        _ = create_process(&process_b_entry);
+
+        yield();
+
+        @panic("Switched to idle process!\n");
     }
 
     while (true) asm volatile ("");
@@ -103,6 +109,28 @@ const Process = struct {
     stack: [8192]u8 align(4),
 };
 
+var process_current: *Process = undefined;
+var process_idle: *Process = undefined;
+
+/// Search for a runnable process, starting with the next process (pid + 1) and ending with the
+/// current process. This is the "round robin" scheduling approach. If no processes are runnable
+/// switch to the idle process.
+noinline fn yield() void {
+    // Process.pid is also the index of the process so we can loop through pid offsets (wrapping
+    // around with % process.len) until we've checked all the processes including the current
+    // process.
+    const process_next = for (1..processes.len + 1) |i| {
+        const process = &processes[(process_current.pid + i) % processes.len];
+        if (process.state == .runnable and process.pid > 0) break process;
+    } else process_idle;
+
+    if (process_next == process_current) return;
+
+    const previous = process_current;
+    process_current = process_next;
+    switch_context(&previous.sp, &process_next.sp);
+}
+
 // TODO: Why does this have to be noinline?
 /// Context switch between processes. Saves the current process's registers onto the kernel-reserved
 /// space on its stack, swaps the stack pointers, then restores the next process's registers from
@@ -164,6 +192,8 @@ var processes = [_]Process{.{
     .stack = undefined,
 }} ** 8;
 
+/// Create a process. Note that the first process created should be the idle process (pid == 0) for
+/// yield() to work.
 fn create_process(pc: *const anyopaque) *Process {
     const p = for (&processes, 0..) |*process, pid| {
         if (process.state == .unused) {
@@ -195,9 +225,6 @@ fn create_process(pc: *const anyopaque) *Process {
     return p;
 }
 
-var process_a: *Process = undefined;
-var process_b: *Process = undefined;
-
 fn delay() void {
     for (0..1_000_000_000) |_| asm volatile ("nop");
 }
@@ -206,8 +233,8 @@ export fn process_a_entry() void {
     console.print("\nStarting process A\n", .{}) catch {};
     while (true) {
         console.print("A", .{}) catch {};
-        switch_context(&process_a.sp, &process_b.sp);
         delay();
+        yield();
     }
 }
 
@@ -215,8 +242,8 @@ export fn process_b_entry() void {
     console.print("\nStarting process B\n", .{}) catch {};
     while (true) {
         console.print("B", .{}) catch {};
-        switch_context(&process_b.sp, &process_a.sp);
         delay();
+        yield();
     }
 }
 
@@ -296,7 +323,7 @@ const TrapFrame = struct {
 /// RISC-V defines 32 integer registers. The first integer register is a zero register, and the
 /// remainder are general-purpose registers. The kernel allocates extra stack space to store the
 /// general purpose registers in the format described by the TrapFrame structure. `handle_trap` is
-/// passed a pointer to this structure and handles the exception logic The CPU state is then
+/// passed a pointer to this structure and handles the exception logic. The CPU state is then
 /// restored and execution is resumed.
 export fn kernel_entry() align(4) callconv(.Naked) void {
     asm volatile (
