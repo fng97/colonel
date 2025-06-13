@@ -1,5 +1,33 @@
 /// RISC-V toy kernel based on the book 'OS in 1,000 Lines'
 
+// From The RISC-V Instruction Set Manual, Volume I: User-Level ISA, Chapter 18: Calling Convention)
+//
+// +----------+-----------+---------------------------------+---------+
+// | Register | ABI Name  | Description                     | Saver   |
+// +----------+-----------+---------------------------------+---------+
+// | x0       | zero      | Hard-wired zero                 | —       |
+// | x1       | ra        | Return address                  | Caller  |
+// | x2       | sp        | Stack pointer                   | Callee  |
+// | x3       | gp        | Global pointer                  | —       |
+// | x4       | tp        | Thread pointer                  | —       |
+// | x5–7     | t0–2      | Temporaries                     | Caller  |
+// | x8       | s0/fp     | Saved register/frame pointer    | Callee  |
+// | x9       | s1        | Saved register                  | Callee  |
+// | x10–11   | a0–1      | Function arguments/return values| Caller  |
+// | x12–17   | a2–7      | Function arguments              | Caller  |
+// | x18–27   | s2–11     | Saved registers                 | Callee  |
+// | x28–31   | t3–6      | Temporaries                     | Caller  |
+// +----------+-----------+---------------------------------+---------+
+// | f0–7     | ft0–7     | FP temporaries                  | Caller  |
+// | f8–9     | fs0–1     | FP saved registers              | Callee  |
+// | f10–11   | fa0–1     | FP arguments/return values      | Caller  |
+// | f12–17   | fa2–7     | FP arguments                    | Caller  |
+// | f18–27   | fs2–11    | FP saved registers              | Callee  |
+// | f28–31   | ft8–11    | FP temporaries                  | Caller  |
+// +----------+-----------+---------------------------------+---------+
+//
+// Table 18.2: RISC-V calling convention register usage.
+
 // Some inline assembly is used. The docs are here:
 // https://ziglang.org/documentation/master/#toc-Assembly
 
@@ -341,37 +369,37 @@ var processes = [_]Process{.{
 var process_current: *Process = undefined;
 var process_idle: *Process = undefined;
 
-/// Create a process. Note that the first process created should be the idle process (pid == 0) for
-/// yield() to work.
-fn create_process(pc: *const anyopaque) *Process {
-    const p = for (&processes, 0..) |*process, pid| {
+/// Create a process, reserving space in its stack for callee-saved registers, and setting the
+/// entrypoint (pc argument). Refer to the chart at the top of this file for what registers must be
+/// saved.
+///
+/// NOTE: The first process created must be the idle process (pid == 0) for yield() to work.
+fn create_process(entrypoint: *const anyopaque) *Process {
+    const process = for (&processes, 0..) |*process, pid| {
         if (process.state == .unused) {
             process.pid = pid;
             break process;
         }
     } else @panic("No free process slots\n");
 
-    // TODO: re-write this part to be like the book so it's more obvious what we're doing.
-    // Create zero-initialise space for the callee-saved registers on the stack.These will be
-    // restored in the first context switch (switch_context).
+    // Reserve space for the callee-saved registers on the stack. s0-s11 are zero-initialised and ra
+    // is set to the process entrypoint. These will be restored in the first context switch. sp is
+    // stored in the Process struct and points to the bottom of stack (which will hold ra).
+    const registers = blk: {
+        // Get the stack as a []usize from []u8 because we're working with registers.
+        const ptr: [*]usize = @alignCast(@ptrCast(&process.stack));
+        const stack = ptr[0 .. process.stack.len / @sizeOf(usize)];
 
-    const regs: []usize = blk: {
-        const ptr: [*]usize = @alignCast(@ptrCast(&p.stack));
-        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
+        const registers = stack[stack.len - 13 ..]; // 14 callee-saved registers (-1 for sp)
+        for (registers[1..]) |*register| register.* = 0; // s0-s11
+        registers[0] = @intFromPtr(entrypoint); // ra
+
+        break :blk registers;
     };
 
-    const sp = regs[regs.len - 13 ..];
-    sp[0] = @intFromPtr(pc);
-
-    std.debug.assert(sp.len == 13);
-
-    for (sp[1..]) |*reg| {
-        reg.* = 0;
-    }
-
-    p.sp = &sp.ptr[0];
-    p.state = .runnable;
-    return p;
+    process.sp = &registers.ptr[0];
+    process.state = .runnable;
+    return process;
 }
 
 /// Search for a runnable process, starting with the next process (pid + 1) and ending with the
@@ -399,12 +427,11 @@ noinline fn yield() void {
     switch_context(&previous.sp, &process_next.sp);
 }
 
-// TODO: Why does this have to be noinline?
 /// Context switch between processes. Saves the current process's registers onto the kernel-reserved
 /// space on its stack, swaps the stack pointers, then restores the next process's registers from
 /// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
 /// local variables on it's stack (Process.stack).
-noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
+noinline fn switch_context(sp_addr_prev: **usize, sp_addr_next: **usize) void {
     asm volatile (
     // Allocate space for 13 4-byte registers.
         \\addi sp, sp, -13 * 4
@@ -425,8 +452,8 @@ noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
         \\sw s11, 12 * 4(sp)
 
         // Switch the stack pointer.
-        \\sw sp, (%[prev_sp]) // *prev_sp = sp
-        \\lw sp, (%[next_sp]) // sp = *next_sp
+        \\sw sp, (%[sp_addr_prev]) // *sp_addr_prev = sp
+        \\lw sp, (%[sp_addr_next]) // sp = *sp_addr_next
 
         // Restore next process's registers from its stack.
         \\lw ra,  0  * 4(sp)
@@ -448,8 +475,8 @@ noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
         \\addi sp, sp, 13 * 4
         \\ret
         :
-        : [prev_sp] "r" (prev_sp),
-          [next_sp] "r" (next_sp),
+        : [sp_addr_prev] "r" (sp_addr_prev),
+          [sp_addr_next] "r" (sp_addr_next),
     );
 }
 
