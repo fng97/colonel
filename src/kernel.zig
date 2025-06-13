@@ -353,7 +353,7 @@ const Process = struct {
     state: enum { unused, runnable },
     // TODO: Make this a usize instead of *usize.
     /// The conventional name for the stack pointer.
-    sp: *usize,
+    sp: usize,
     /// Used to store CPU registers, return addresses (where it was called from), and local
     /// variables between context switches.
     stack: [8192]u8 align(4),
@@ -397,7 +397,7 @@ fn create_process(entrypoint: *const anyopaque) *Process {
         break :blk registers;
     };
 
-    process.sp = &registers.ptr[0];
+    process.sp = @intFromPtr(&registers[0]);
     process.state = .runnable;
     return process;
 }
@@ -431,7 +431,7 @@ noinline fn yield() void {
 /// space on its stack, swaps the stack pointers, then restores the next process's registers from
 /// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
 /// local variables on it's stack (Process.stack).
-noinline fn switch_context(sp_addr_prev: **usize, sp_addr_next: **usize) void {
+noinline fn switch_context(sp_addr_prev: *usize, sp_addr_next: *usize) void {
     asm volatile (
     // Allocate space for 13 4-byte registers.
         \\addi sp, sp, -13 * 4
