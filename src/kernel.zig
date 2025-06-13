@@ -9,11 +9,30 @@
 
 const std = @import("std");
 
+// Symbols from the linker script.
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
 const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
+
+/// This is the entrypoint of the program as defined in the linker script.
+export fn boot() linksection(".text.boot") callconv(.Naked) void {
+    asm volatile (
+        \\mv sp, %[stack_top]
+        \\j kernel_main
+        :
+        : [stack_top] "r" (stack_top),
+    );
+}
+
+/// The kernel main function called by boot. This just calls main. Because boot uses inline assembly
+/// to jump here and the C ABI doesn't speak Zig errors we just use this function to bridge the gap.
+/// We catch and print any errors here so that we can use `try` in main.
+export fn kernel_main() noreturn {
+    main() catch |err| std.debug.panic("{s}\n", .{@errorName(err)});
+    unreachable;
+}
 
 /// The kernel main function.
 fn main() !void {
@@ -47,211 +66,7 @@ fn main() !void {
     while (true) asm volatile ("");
 }
 
-/// The kernel main function called by boot. This just calls main. Because boot uses inline assembly
-/// to jump here and the C ABI doesn't speak Zig errors we just use this function to bridge the gap.
-/// We catch and print any errors here so that we can use `try` in main.
-export fn kernel_main() noreturn {
-    main() catch |err| std.debug.panic("{s}\n", .{@errorName(err)});
-    unreachable;
-}
-
-pub fn panic(
-    msg: []const u8,
-    error_return_trace: ?*std.builtin.StackTrace,
-    ret_addr: ?usize,
-) noreturn {
-    _ = error_return_trace;
-    _ = ret_addr;
-
-    console.print("PANIC: {s}", .{msg}) catch {};
-    while (true) asm volatile ("");
-}
-
-export fn boot() linksection(".text.boot") callconv(.Naked) void {
-    asm volatile (
-        \\mv sp, %[stack_top]
-        \\j kernel_main
-        :
-        : [stack_top] "r" (stack_top),
-    );
-}
-
-var ram_used: usize = 0;
-
-/// A simple bump allocator.
-///
-/// TODO: Support freeing memory. Consider a bitmap-based algorithm or the "buddy system".
-fn alloc_pages(pages: usize) []u8 {
-    const page_size = 4096;
-    const ram: []u8 = ram_start[0 .. ram_end - ram_start];
-
-    const alloc_size = pages * page_size;
-    const ram_available = ram[ram_used..];
-
-    if (alloc_size > ram_available.len) @panic("Out of memory");
-
-    const result = ram_available[0..alloc_size];
-    @memset(result, 0);
-    ram_used += alloc_size;
-
-    return result;
-}
-
-const Process = struct {
-    /// The conventional name for the process ID.
-    pid: u32,
-    state: enum { unused, runnable },
-    // TODO: Make this a usize instead of *usize.
-    /// The conventional name for the stack pointer.
-    sp: *usize,
-    /// Used to store CPU registers, return addresses (where it was called from), and local
-    /// variables between context switches.
-    stack: [8192]u8 align(4),
-};
-
-var process_current: *Process = undefined;
-var process_idle: *Process = undefined;
-
-/// Search for a runnable process, starting with the next process (pid + 1) and ending with the
-/// current process. This is the "round robin" scheduling approach. If no processes are runnable
-/// switch to the idle process.
-noinline fn yield() void {
-    // Process.pid is also the index of the process so we can loop through pid offsets (wrapping
-    // around with % process.len) until we've checked all the processes including the current
-    // process.
-    const process_next = for (1..processes.len + 1) |i| {
-        const process = &processes[(process_current.pid + i) % processes.len];
-        if (process.state == .runnable and process.pid > 0) break process;
-    } else process_idle;
-
-    if (process_next == process_current) return;
-
-    asm volatile (
-        \\csrw sscratch, %[sscratch]
-        :
-        : [sscratch] "r" (process_next.stack[0..].ptr[process_next.stack.len - 1]),
-    );
-
-    const previous = process_current;
-    process_current = process_next;
-    switch_context(&previous.sp, &process_next.sp);
-}
-
-// TODO: Why does this have to be noinline?
-/// Context switch between processes. Saves the current process's registers onto the kernel-reserved
-/// space on its stack, swaps the stack pointers, then restores the next process's registers from
-/// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
-/// local variables on it's stack (Process.stack).
-noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
-    asm volatile (
-    // Allocate space for 13 4-byte registers.
-        \\addi sp, sp, -13 * 4 
-
-        // Save current process's registers.
-        \\sw ra,  0  * 4(sp)   
-        \\sw s0,  1  * 4(sp)
-        \\sw s1,  2  * 4(sp)
-        \\sw s2,  3  * 4(sp)
-        \\sw s3,  4  * 4(sp)
-        \\sw s4,  5  * 4(sp)
-        \\sw s5,  6  * 4(sp)
-        \\sw s6,  7  * 4(sp)
-        \\sw s7,  8  * 4(sp)
-        \\sw s8,  9  * 4(sp)
-        \\sw s9,  10 * 4(sp)
-        \\sw s10, 11 * 4(sp)
-        \\sw s11, 12 * 4(sp)
-
-        // Switch the stack pointer.
-        \\sw sp, (%[prev_sp]) // *prev_sp = sp
-        \\lw sp, (%[next_sp]) // sp = *next_sp
-
-        // Restore next process's registers from its stack.
-        \\lw ra,  0  * 4(sp)
-        \\lw s0,  1  * 4(sp)
-        \\lw s1,  2  * 4(sp)
-        \\lw s2,  3  * 4(sp)
-        \\lw s3,  4  * 4(sp)
-        \\lw s4,  5  * 4(sp)
-        \\lw s5,  6  * 4(sp)
-        \\lw s6,  7  * 4(sp)
-        \\lw s7,  8  * 4(sp)
-        \\lw s8,  9  * 4(sp)
-        \\lw s9,  10 * 4(sp)
-        \\lw s10, 11 * 4(sp)
-        \\lw s11, 12 * 4(sp)
-
-        // After popping the 13 4-byte registers from the next process's stack we can restore the
-        // stack pointer to where it was before yielding execution and return.
-        \\addi sp, sp, 13 * 4  
-        \\ret
-        :
-        : [prev_sp] "r" (prev_sp),
-          [next_sp] "r" (next_sp),
-    );
-}
-
-var processes = [_]Process{.{
-    .pid = 0,
-    .state = .unused,
-    .sp = undefined,
-    .stack = undefined,
-}} ** 8;
-
-/// Create a process. Note that the first process created should be the idle process (pid == 0) for
-/// yield() to work.
-fn create_process(pc: *const anyopaque) *Process {
-    const p = for (&processes, 0..) |*process, pid| {
-        if (process.state == .unused) {
-            process.pid = pid;
-            break process;
-        }
-    } else @panic("No free process slots\n");
-
-    // TODO: re-write this part to be like the book so it's more obvious what we're doing.
-    // Create zero-initialise space for the callee-saved registers on the stack.These will be
-    // restored in the first context switch (switch_context).
-
-    const regs: []usize = blk: {
-        const ptr: [*]usize = @alignCast(@ptrCast(&p.stack));
-        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
-    };
-
-    const sp = regs[regs.len - 13 ..];
-    sp[0] = @intFromPtr(pc);
-
-    std.debug.assert(sp.len == 13);
-
-    for (sp[1..]) |*reg| {
-        reg.* = 0;
-    }
-
-    p.sp = &sp.ptr[0];
-    p.state = .runnable;
-    return p;
-}
-
-fn delay() void {
-    for (0..1_000_000_000) |_| asm volatile ("nop");
-}
-
-export fn process_a_entry() void {
-    console.print("\nStarting process A\n", .{}) catch {};
-    while (true) {
-        console.print("A", .{}) catch {};
-        delay();
-        yield();
-    }
-}
-
-export fn process_b_entry() void {
-    console.print("\nStarting process B\n", .{}) catch {};
-    while (true) {
-        console.print("B", .{}) catch {};
-        delay();
-        yield();
-    }
-}
+// SUPERVISOR BINARY INTERFACE (SBI) CALLS
 
 const SbiRet = struct {
     err: usize,
@@ -289,6 +104,34 @@ pub fn sbi_call(
 
     return .{ .err = err, .value = value };
 }
+
+// SERIAL CONSOLE
+
+fn write_fn(_: *const anyopaque, bytes: []const u8) !usize {
+    for (bytes) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
+    return bytes.len;
+}
+
+const console: std.io.AnyWriter = .{
+    .context = undefined,
+    .writeFn = write_fn,
+};
+
+/// The panic handler. Just prints the message to the console and stalls the program. By default Zig
+/// uses the panic handler defined in the root of the executable.
+pub fn panic(
+    msg: []const u8,
+    error_return_trace: ?*std.builtin.StackTrace,
+    ret_addr: ?usize,
+) noreturn {
+    _ = error_return_trace;
+    _ = ret_addr;
+
+    console.print("PANIC: {s}", .{msg}) catch {};
+    while (true) asm volatile ("");
+}
+
+// TRAP HANDLER
 
 const TrapFrame = struct {
     ra: usize,
@@ -451,12 +294,183 @@ fn write_csr(comptime register: []const u8, val: usize) void {
     );
 }
 
-const console: std.io.AnyWriter = .{
-    .context = undefined,
-    .writeFn = write_fn,
+// MEMORY ALLOCATION
+
+var ram_used: usize = 0;
+
+/// A simple bump allocator.
+///
+/// TODO: Support freeing memory. Consider a bitmap-based algorithm or the "buddy system".
+fn alloc_pages(pages: usize) []u8 {
+    const page_size = 4096;
+    const ram: []u8 = ram_start[0 .. ram_end - ram_start];
+
+    const alloc_size = pages * page_size;
+    const ram_available = ram[ram_used..];
+
+    if (alloc_size > ram_available.len) @panic("Out of memory");
+
+    const result = ram_available[0..alloc_size];
+    @memset(result, 0);
+    ram_used += alloc_size;
+
+    return result;
+}
+
+// PROCESSES
+
+const Process = struct {
+    /// The conventional name for the process ID.
+    pid: u32,
+    state: enum { unused, runnable },
+    // TODO: Make this a usize instead of *usize.
+    /// The conventional name for the stack pointer.
+    sp: *usize,
+    /// Used to store CPU registers, return addresses (where it was called from), and local
+    /// variables between context switches.
+    stack: [8192]u8 align(4),
 };
 
-fn write_fn(_: *const anyopaque, bytes: []const u8) !usize {
-    for (bytes) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
-    return bytes.len;
+var processes = [_]Process{.{
+    .pid = 0,
+    .state = .unused,
+    .sp = undefined,
+    .stack = undefined,
+}} ** 8;
+
+var process_current: *Process = undefined;
+var process_idle: *Process = undefined;
+
+/// Create a process. Note that the first process created should be the idle process (pid == 0) for
+/// yield() to work.
+fn create_process(pc: *const anyopaque) *Process {
+    const p = for (&processes, 0..) |*process, pid| {
+        if (process.state == .unused) {
+            process.pid = pid;
+            break process;
+        }
+    } else @panic("No free process slots\n");
+
+    // TODO: re-write this part to be like the book so it's more obvious what we're doing.
+    // Create zero-initialise space for the callee-saved registers on the stack.These will be
+    // restored in the first context switch (switch_context).
+
+    const regs: []usize = blk: {
+        const ptr: [*]usize = @alignCast(@ptrCast(&p.stack));
+        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
+    };
+
+    const sp = regs[regs.len - 13 ..];
+    sp[0] = @intFromPtr(pc);
+
+    std.debug.assert(sp.len == 13);
+
+    for (sp[1..]) |*reg| {
+        reg.* = 0;
+    }
+
+    p.sp = &sp.ptr[0];
+    p.state = .runnable;
+    return p;
+}
+
+/// Search for a runnable process, starting with the next process (pid + 1) and ending with the
+/// current process. This is the "round robin" scheduling approach. If no processes are runnable
+/// switch to the idle process.
+noinline fn yield() void {
+    // Process.pid is also the index of the process so we can loop through pid offsets (wrapping
+    // around with % process.len) until we've checked all the processes including the current
+    // process.
+    const process_next = for (1..processes.len + 1) |i| {
+        const process = &processes[(process_current.pid + i) % processes.len];
+        if (process.state == .runnable and process.pid > 0) break process;
+    } else process_idle;
+
+    if (process_next == process_current) return;
+
+    asm volatile (
+        \\csrw sscratch, %[sscratch]
+        :
+        : [sscratch] "r" (process_next.stack[0..].ptr[process_next.stack.len - 1]),
+    );
+
+    const previous = process_current;
+    process_current = process_next;
+    switch_context(&previous.sp, &process_next.sp);
+}
+
+// TODO: Why does this have to be noinline?
+/// Context switch between processes. Saves the current process's registers onto the kernel-reserved
+/// space on its stack, swaps the stack pointers, then restores the next process's registers from
+/// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
+/// local variables on it's stack (Process.stack).
+noinline fn switch_context(prev_sp: **usize, next_sp: **usize) void {
+    asm volatile (
+    // Allocate space for 13 4-byte registers.
+        \\addi sp, sp, -13 * 4
+
+        // Save current process's registers.
+        \\sw ra,  0  * 4(sp)
+        \\sw s0,  1  * 4(sp)
+        \\sw s1,  2  * 4(sp)
+        \\sw s2,  3  * 4(sp)
+        \\sw s3,  4  * 4(sp)
+        \\sw s4,  5  * 4(sp)
+        \\sw s5,  6  * 4(sp)
+        \\sw s6,  7  * 4(sp)
+        \\sw s7,  8  * 4(sp)
+        \\sw s8,  9  * 4(sp)
+        \\sw s9,  10 * 4(sp)
+        \\sw s10, 11 * 4(sp)
+        \\sw s11, 12 * 4(sp)
+
+        // Switch the stack pointer.
+        \\sw sp, (%[prev_sp]) // *prev_sp = sp
+        \\lw sp, (%[next_sp]) // sp = *next_sp
+
+        // Restore next process's registers from its stack.
+        \\lw ra,  0  * 4(sp)
+        \\lw s0,  1  * 4(sp)
+        \\lw s1,  2  * 4(sp)
+        \\lw s2,  3  * 4(sp)
+        \\lw s3,  4  * 4(sp)
+        \\lw s4,  5  * 4(sp)
+        \\lw s5,  6  * 4(sp)
+        \\lw s6,  7  * 4(sp)
+        \\lw s7,  8  * 4(sp)
+        \\lw s8,  9  * 4(sp)
+        \\lw s9,  10 * 4(sp)
+        \\lw s10, 11 * 4(sp)
+        \\lw s11, 12 * 4(sp)
+
+        // After popping the 13 4-byte registers from the next process's stack we can restore the
+        // stack pointer to where it was before yielding execution and return.
+        \\addi sp, sp, 13 * 4
+        \\ret
+        :
+        : [prev_sp] "r" (prev_sp),
+          [next_sp] "r" (next_sp),
+    );
+}
+
+fn delay() void {
+    for (0..1_000_000_000) |_| asm volatile ("nop");
+}
+
+export fn process_a_entry() void {
+    console.print("\nStarting process A\n", .{}) catch {};
+    while (true) {
+        console.print("A", .{}) catch {};
+        delay();
+        yield();
+    }
+}
+
+export fn process_b_entry() void {
+    console.print("\nStarting process B\n", .{}) catch {};
+    while (true) {
+        console.print("B", .{}) catch {};
+        delay();
+        yield();
+    }
 }
