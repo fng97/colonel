@@ -45,7 +45,7 @@ const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
 const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
 
 /// This is the entrypoint of the program as defined in the linker script.
-export fn boot() linksection(".text.boot") callconv(.Naked) void {
+export fn boot() linksection(".text.boot") callconv(.naked) void {
     asm volatile (
         \\mv sp, %[stack_top]
         \\j kernel_main
@@ -127,8 +127,7 @@ pub fn sbi_call(
           [arg5] "{a5}" (arg5),
           [arg6] "{a6}" (fid),
           [arg7] "{a7}" (eid),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     return .{ .err = err, .value = value };
 }
@@ -202,7 +201,7 @@ const TrapFrame = struct {
 /// general purpose registers in the format described by the TrapFrame structure. `handle_trap` is
 /// passed a pointer to this structure and handles the exception logic. The CPU state is then
 /// restored and execution is resumed.
-export fn kernel_entry() align(4) callconv(.Naked) void {
+export fn kernel_entry() align(4) callconv(.naked) void {
     asm volatile (
     // Store the original stack pointer in sscratch while loading the kernel stack sp previously
     // stored in yield().
@@ -387,7 +386,7 @@ fn create_process(entrypoint: *const anyopaque) *Process {
     // stored in the Process struct and points to the bottom of stack (which will hold ra).
     const registers = blk: {
         // Get the stack as a []usize from []u8 because we're working with registers.
-        const ptr: [*]usize = @alignCast(@ptrCast(&process.stack));
+        const ptr: [*]usize = @ptrCast(@alignCast(&process.stack));
         const stack = ptr[0 .. process.stack.len / @sizeOf(usize)];
 
         const registers = stack[stack.len - 13 ..]; // 14 callee-saved registers (-1 for sp)
