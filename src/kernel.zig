@@ -28,9 +28,6 @@
 //
 // Table 18.2: RISC-V calling convention register usage.
 
-// Some inline assembly is used. The docs are here:
-// https://ziglang.org/documentation/master/#toc-Assembly
-
 // TODO:
 // - Get assertions working (we're using ReleaseSmall).
 // - Unreachable should print something sensible? I assume it doesn't because we've redefined panic.
@@ -38,6 +35,7 @@
 const std = @import("std");
 
 // Symbols from the linker script.
+const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" }); // start of kernel memory
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
@@ -58,6 +56,7 @@ export fn boot() linksection(".text.boot") callconv(.naked) void {
 /// to jump here and the C ABI doesn't speak Zig errors we just use this function to bridge the gap.
 /// We catch and print any errors here so that we can use `try` in main.
 export fn kernel_main() noreturn {
+    // TODO: Replace this with try.
     main() catch |err| std.debug.panic("{s}\n", .{@errorName(err)});
     unreachable;
 }
@@ -80,12 +79,14 @@ fn main() !void {
     }
 
     {
+        //
         process_idle = create_process(undefined);
         process_current = process_idle;
 
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
 
+        //
         yield();
 
         @panic("Switched to idle process!\n");
@@ -203,8 +204,8 @@ const TrapFrame = struct {
 /// restored and execution is resumed.
 export fn kernel_entry() align(4) callconv(.naked) void {
     asm volatile (
-    // Store the original stack pointer in sscratch while loading the kernel stack sp previously
-    // stored in yield().
+    // Swap the current user/pre-trap stack pointer with the kernel stack pointer previously stored
+    // in yield().
         \\csrrw sp, sscratch, sp
 
         // Decrease the stack pointer to allocate space for the 31 general purpose registers (4
@@ -251,7 +252,8 @@ export fn kernel_entry() align(4) callconv(.naked) void {
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
 
-        // Reset the kernel stack.
+        // Restore the original kernel stack pointer to sscratch. sscratch must hold a usable kernel
+        // stack pointer (instead of user sp) in case we have a nested trap or interrupt.
         \\addi a0, sp, 4 * 31
         \\csrw sscratch, a0
 
@@ -323,23 +325,28 @@ fn write_csr(comptime register: []const u8, val: usize) void {
 
 // MEMORY ALLOCATION
 
-var ram_used: usize = 0;
+var ram_used_bytes: usize = 0;
+const page_size_bytes = 4096;
 
 /// A simple bump allocator.
 ///
 /// TODO: Support freeing memory. Consider a bitmap-based algorithm or the "buddy system".
 fn alloc_pages(pages: usize) []u8 {
-    const page_size = 4096;
     const ram: []u8 = ram_start[0 .. ram_end - ram_start];
 
-    const alloc_size = pages * page_size;
-    const ram_available = ram[ram_used..];
+    const alloc_size_bytes = pages * page_size_bytes;
+    const ram_available = ram[ram_used_bytes..];
 
-    if (alloc_size > ram_available.len) @panic("Out of memory");
+    if (alloc_size_bytes > ram_available.len) @panic("Out of memory");
 
-    const result = ram_available[0..alloc_size];
+    const result = ram_available[0..alloc_size_bytes];
     @memset(result, 0);
-    ram_used += alloc_size;
+    ram_used_bytes += alloc_size_bytes;
+
+    // console.print(
+    //     "Memory available: {} bytes. Allocating {} pages. Remaining after allocation: {} bytes\n",
+    //     .{ ram_available.len, pages, ram_available.len - ram_used_bytes },
+    // ) catch {};
 
     return result;
 }
@@ -350,9 +357,10 @@ const Process = struct {
     /// The conventional name for the process ID.
     pid: u32,
     state: enum { unused, runnable },
-    // TODO: Make this a usize instead of *usize.
     /// The conventional name for the stack pointer.
     sp: usize,
+    /// Pointer to the first-level page table, the page directory.
+    page_directory: [*]PageTableEntry,
     /// Used to store CPU registers, return addresses (where it was called from), and local
     /// variables between context switches.
     stack: [8192]u8 align(4),
@@ -362,6 +370,7 @@ var processes = [_]Process{.{
     .pid = 0,
     .state = .unused,
     .sp = undefined,
+    .page_directory = undefined,
     .stack = undefined,
 }} ** 8;
 
@@ -396,7 +405,22 @@ fn create_process(entrypoint: *const anyopaque) *Process {
         break :blk registers;
     };
 
-    process.sp = @intFromPtr(&registers[0]);
+    // Map kernel pages.
+    const page_directory_buffer = alloc_pages(1);
+    const page_directory: [*]PageTableEntry = @ptrCast(@alignCast(page_directory_buffer.ptr));
+
+    var paddr: usize = @intFromPtr(kernel_base);
+    while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes) {
+        // console.print("paddr: {*}\n", .{paddr}) catch {};
+        map_page(page_directory, @bitCast(paddr), paddr, .{
+            .readable = true,
+            .writable = true,
+            .executable = true,
+        });
+    }
+
+    process.sp = @intFromPtr(registers.ptr);
+    process.page_directory = page_directory;
     process.state = .runnable;
     return process;
 }
@@ -416,9 +440,13 @@ noinline fn yield() void {
     if (process_next == process_current) return;
 
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\csrw sscratch, %[sscratch]
         :
-        : [sscratch] "r" (process_next.stack[0..].ptr[process_next.stack.len - 1]),
+        : [satp] "r" (satp | (@intFromPtr(&process_next.page_directory[0]) / page_size_bytes)),
+          [sscratch] "r" (@intFromPtr(process_next.stack[0..].ptr) + process_next.stack.len),
     );
 
     const previous = process_current;
@@ -499,4 +527,95 @@ export fn process_b_entry() void {
         delay();
         yield();
     }
+}
+
+// PAGE TABLE
+
+// NOTE: We're using Sv32 which (I think) stands for [S]upervisor-mode [V]irtual memory with 32-bit
+// virtual addresses. It uses a two-level page table. The 32-bit virtual address is divided into a
+// first-level page table index (VPN[1]), a second-level page table index (VPN[0]), and a page
+// offset. That's right, they call the first-level page table table1 and the second-level page table
+// table0... I think it's because to get a physical address from a virtual address you index the
+// first-level page table before the second-level page table.
+
+const VirtualAddress = packed struct(u32) {
+    /// The page offset indexes bytes in a page (it's 12 bits because a page is 2^12=4096 bytes).
+    offset: u12,
+    /// Index into the second-level page table (table0). This index is referred to as VPN[2]: the
+    /// [V]irtual [P]age [N]umber of the [2]nd-level page table.
+    vpn0: u10,
+    /// Index into the first-level page table (the page directory, table1). This index is referred
+    /// to as VPN[1]: the [V]irtual [P]age [N]umber of the [1]st-level page table.
+    vpn1: u10,
+};
+
+/// Supervisor Address Translation and Protection CSR.
+// const Satp = packed struct(u32) {
+//     reserved: u31 = undefined,
+//     /// Enables paging in Sv32 mode.
+//     sv32: bool,
+// };
+//
+// const satp: Satp = .{ .sv32 = true };
+const satp: usize = 1 << 31;
+
+/// This struct is basically just an address with some metadata stuffed in. Because all of the
+/// addresses stored in page table entries are 4 KiB (4096) aligned, they always ends with 12 zeroes
+/// (2^12 = 4096). Don't fully get this yet but we get rid of the zeroes by diving by the page table
+/// size. This gives us the page table number. This is then stored in the top 22 bits, leaving 10
+/// bits for metadata. (Why store the address in the top 22 bits if only 20 bits of it are
+/// non-zero?)
+const PageTableEntry = packed struct(u32) {
+    valid: bool = false, // entry enabled
+    readable: bool = false,
+    writable: bool = false,
+    executable: bool = false,
+    user: bool = false, // accessible in user mode
+    _: u5 = undefined,
+    /// Physical page number (PPN): If this is a page directory entry this points to a page table.
+    /// If this is a page table entry this points to the page being looked up.
+    ppn: u22 = undefined,
+
+    fn addr(entry: PageTableEntry) usize {
+        return entry.ppn * page_size_bytes;
+    }
+};
+
+/// There are 1024 entries in the page directory, a.k.a. the first-level page table. It takes up
+/// 4096 bytes (i.e. a page's-worth): 1024 32-bit entries. Each entry points to a (second-level)
+/// page table that also contains 1024 entries (another 4096 bytes). Each of those entries point to
+/// a physical page.
+fn map_page(
+    page_directory: [*]PageTableEntry,
+    vaddr: usize,
+    paddr: usize,
+    flags: PageTableEntry, // entry with just flags initialised
+) void {
+    // The virtual and physical addresses must be aligned to the page size.
+    if (vaddr % page_size_bytes != 0) std.debug.panic("unaligned vaddr ({})", .{vaddr});
+    if (paddr % page_size_bytes != 0) std.debug.panic("unaligned paddr ({})", .{paddr});
+
+    const virtual_address: VirtualAddress = @bitCast(vaddr);
+
+    var page_directory_entry = &page_directory[virtual_address.vpn1]; // first-level page table entry
+    // Initialise the 1st-level page table entry if it doesn't exist: allocate a page to store the
+    // second-level page table.
+    if (!page_directory_entry.valid) {
+        // Allocate memory for the (second-level) page table.
+        const page_table_bytes = alloc_pages(1);
+        // Store the address of the page table as a PPN (i.e. a multiple of the page size).
+        page_directory_entry.ppn = @intCast(@intFromPtr(page_table_bytes.ptr) / page_size_bytes);
+        page_directory_entry.valid = true;
+    }
+
+    // Set the 2nd-level page table entry to map the physical page.
+    const page_table: [*]PageTableEntry = @ptrFromInt(page_directory_entry.addr());
+    var page_table_entry = &page_table[virtual_address.vpn0];
+    page_table_entry.valid = true;
+    page_table_entry.readable = flags.readable;
+    page_table_entry.writable = flags.writable;
+    page_table_entry.executable = flags.executable;
+    page_table_entry.user = flags.user;
+    // Store the address of the physical page as a PPN.
+    page_table_entry.ppn = @intCast(paddr / page_size_bytes);
 }
