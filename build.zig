@@ -8,7 +8,9 @@ pub fn build(b: *std.Build) void {
             .os_tag = .freestanding,
             .abi = .none,
         }),
-        .optimize = .ReleaseSmall, // TODO: try ReleaseSafe
+        // Was originally using ReleaseSmall. However, ReleaseSafe makes more sense for development.
+        // However, it generates a lot more code. Switch to ReleaseSmall when inspecting assembly.
+        .optimize = .ReleaseSafe,
         .strip = false, // keep debug symbols
     });
 

@@ -28,21 +28,20 @@
 //
 // Table 18.2: RISC-V calling convention register usage.
 
-// Some inline assembly is used. The docs are here:
-// https://ziglang.org/documentation/master/#toc-Assembly
-
 // TODO:
 // - Get assertions working (we're using ReleaseSmall).
 // - Unreachable should print something sensible? I assume it doesn't because we've redefined panic.
+// - Get backtraces working.
 
 const std = @import("std");
 
 // Symbols from the linker script.
+const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" }); // start of kernel memory
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 const ram_start = @extern([*]u8, .{ .name = "__free_ram" });
-const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
+const ram_end = @extern([*]u8, .{ .name = "__free_ram_end" }); // end of kernel memory
 
 /// This is the entrypoint of the program as defined in the linker script.
 export fn boot() linksection(".text.boot") callconv(.naked) void {
@@ -80,12 +79,14 @@ fn main() !void {
     }
 
     {
+        //
         process_idle = create_process(undefined);
         process_current = process_idle;
 
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
 
+        //
         yield();
 
         @panic("Switched to idle process!\n");
@@ -203,8 +204,8 @@ const TrapFrame = struct {
 /// restored and execution is resumed.
 export fn kernel_entry() align(4) callconv(.naked) void {
     asm volatile (
-    // Store the original stack pointer in sscratch while loading the kernel stack sp previously
-    // stored in yield().
+    // Swap the current user/pre-trap stack pointer with the kernel stack pointer previously stored
+    // in yield().
         \\csrrw sp, sscratch, sp
 
         // Decrease the stack pointer to allocate space for the 31 general purpose registers (4
@@ -251,7 +252,8 @@ export fn kernel_entry() align(4) callconv(.naked) void {
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
 
-        // Reset the kernel stack.
+        // Restore the original kernel stack pointer to sscratch. sscratch must hold a usable kernel
+        // stack pointer (instead of user sp) in case we have a nested trap or interrupt.
         \\addi a0, sp, 4 * 31
         \\csrw sscratch, a0
 
@@ -323,23 +325,23 @@ fn write_csr(comptime register: []const u8, val: usize) void {
 
 // MEMORY ALLOCATION
 
-var ram_used: usize = 0;
+var ram_used_bytes: usize = 0;
+const page_size_bytes = 4096;
 
-/// A simple bump allocator.
+/// A simple bump allocator. Clears allocated memory to zero.
 ///
 /// TODO: Support freeing memory. Consider a bitmap-based algorithm or the "buddy system".
 fn alloc_pages(pages: usize) []u8 {
-    const page_size = 4096;
     const ram: []u8 = ram_start[0 .. ram_end - ram_start];
 
-    const alloc_size = pages * page_size;
-    const ram_available = ram[ram_used..];
+    const alloc_size_bytes = pages * page_size_bytes;
+    const ram_available = ram[ram_used_bytes..];
 
-    if (alloc_size > ram_available.len) @panic("Out of memory");
+    if (alloc_size_bytes > ram_available.len) @panic("Out of memory");
 
-    const result = ram_available[0..alloc_size];
+    const result = ram_available[0..alloc_size_bytes];
     @memset(result, 0);
-    ram_used += alloc_size;
+    ram_used_bytes += alloc_size_bytes;
 
     return result;
 }
@@ -350,9 +352,10 @@ const Process = struct {
     /// The conventional name for the process ID.
     pid: u32,
     state: enum { unused, runnable },
-    // TODO: Make this a usize instead of *usize.
     /// The conventional name for the stack pointer.
     sp: usize,
+    /// Pointer to the first-level page table, the page directory.
+    page_directory: *[page_table_size]PageTableEntry,
     /// Used to store CPU registers, return addresses (where it was called from), and local
     /// variables between context switches.
     stack: [8192]u8 align(4),
@@ -362,6 +365,7 @@ var processes = [_]Process{.{
     .pid = 0,
     .state = .unused,
     .sp = undefined,
+    .page_directory = undefined,
     .stack = undefined,
 }} ** 8;
 
@@ -396,7 +400,22 @@ fn create_process(entrypoint: *const anyopaque) *Process {
         break :blk registers;
     };
 
-    process.sp = @intFromPtr(&registers[0]);
+    // Map all virtual addresses to physical addresses from the start of memory (krenel_base) to the
+    // end (ram_end).
+    const page = alloc_pages(1);
+    const page_directory: *[page_table_size]PageTableEntry = @ptrCast(@alignCast(page.ptr));
+    var paddr: usize = @intFromPtr(&kernel_base[0]);
+    while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes) {
+        map_page(page_directory, paddr, paddr, .{
+            .readable = true,
+            .writable = true,
+            .executable = true,
+            .user = false,
+        });
+    }
+
+    process.sp = @intFromPtr(registers.ptr);
+    process.page_directory = page_directory;
     process.state = .runnable;
     return process;
 }
@@ -416,9 +435,14 @@ noinline fn yield() void {
     if (process_next == process_current) return;
 
     asm volatile (
+        \\sfence.vma
+        // Update the SATP CSR with the next process's page table.
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\csrw sscratch, %[sscratch]
         :
-        : [sscratch] "r" (process_next.stack[0..].ptr[process_next.stack.len - 1]),
+        : [satp] "r" (SatpCsr.from_page_directory(process_next.page_directory)),
+          [sscratch] "r" (@intFromPtr(process_next.stack[0..].ptr) + process_next.stack.len),
     );
 
     const previous = process_current;
@@ -499,4 +523,136 @@ export fn process_b_entry() void {
         delay();
         yield();
     }
+}
+
+// PAGE TABLE
+
+// NOTE: We're using Sv32 which (I think) stands for [S]upervisor-mode [V]irtual memory with 32-bit
+// virtual addresses. It uses a two-level page table. The 32-bit virtual address is divided into a
+// first-level page table index (VPN[1]), a second-level page table index (VPN[0]), and a page
+// offset. That's right, they call the first-level page table table1 and the second-level page table
+// table0... I think it's because to get a physical address from a virtual address you index the
+// first-level page table before the second-level page table.
+
+/// Virtual addresses are mapped to physical addresses by the kernel. Their 32-bit structure stores
+/// two virtual page numbers (VPN[1] and VPN[0]) and an offset used by the CPU to look up the
+/// physical addresses using the page tables:
+///
+/// 1. The CPU is given the address of the process's page directory by the kernel (see SATP CSR).
+/// 2. The entry at index VPN[1] in the page directory stores the physical page number (PPN)
+///    of the page table.
+/// 3. The entry at index VPN[0] in the page table stores PPN of the physical page containing the
+///    physical address.
+/// 4. Finally, the offset indicates the physical address in that page.
+const VirtualAddress = packed struct(u32) {
+    /// The page offset indexes bytes in a page (it's 12 bits because a page is 2^12 = 4096 bytes).
+    offset: u12,
+    /// Index into the second-level page table (table0). This index is referred to as VPN[2]: the
+    /// [V]irtual [P]age [N]umber of the [2]nd-level page table.
+    vpn0: u10,
+    /// Index into the first-level page table (the page directory, table1). This index is referred
+    /// to as VPN[1]: the [V]irtual [P]age [N]umber of the [1]st-level page table.
+    vpn1: u10,
+};
+
+/// The number of entries in a (first or second level) page table. This are 1024 entries on a 32-bit
+/// system with a page size of 4 KiB.
+const page_table_size = page_size_bytes / @sizeOf(PageTableEntry);
+
+/// A page table entry stores a physical page number which corresponds to the physical address of a
+/// page. Sv32 uses two levels of page tables. A valid entry in the first-level page table (referred
+/// to as the page directory) points to a second-level page table (referred to as the page table). A
+/// valid entry in the second-level page table points to a mapped page.
+///
+/// Page table structures are used to map virtual addresses to physical addresses. These physical
+/// addresses are always aligned to (read: multiples of) the page size (4096 bytes). If we stored
+/// these as 32-bit addresses, the 12 least significant bits would be zero (2^12 = 4096). By storing
+/// them as multiples of the page size (page numbers) we free up those 12 bits! This allows us to
+/// use 10 of the 32 bits for flags and the remaining 22 bits for the page number. That means we
+/// actually have 34-bit addresses: 22 bits plus the 12-bit offset. Therefore, Rv32 allows us to map
+/// a 32-bit virtual address space (4 GiB) to a 34-bit physical address space (16 GiB). In other
+/// words, a process can use up to 4 GiB of virtual memory but the CPU can access up to 16 GiB of
+/// physical memory.
+const PageTableEntry = packed struct(u32) {
+    valid: bool, // entry is initialised
+    flags: Flags,
+    /// Physical page number (PPN).
+    ppn: u22,
+
+    const Flags = packed struct(u9) {
+        readable: bool,
+        writable: bool,
+        executable: bool,
+        user: bool, // accessible in user mode
+        _: u5 = 0, // no idea what these do
+    };
+
+    /// Create a valid page table entry from an address with the provided flags.
+    fn from_address(addr: u32, flags: Flags) PageTableEntry {
+        return .{
+            .valid = true,
+            .flags = flags,
+            .ppn = @intCast(addr / page_size_bytes),
+        };
+    }
+
+    /// Get a pointer to the page table that lives at the stored address. This method is only used
+    /// on page directory entries.
+    fn page_table(pte: PageTableEntry) *[page_table_size]PageTableEntry {
+        // The page number must be widened from u22 to u32 to prevent overflow.
+        const page_number: u32 = pte.ppn;
+        return @ptrFromInt(page_number * page_size_bytes);
+    }
+};
+
+/// Register structure that enables Sv32 paging in the Supervisor Address Translation and Protection
+/// (SATP) CSR. This CSR updated every time we context switch with the next context's page directory
+/// so that the CPU is looking up virtual addresses using the correct page tables.
+const SatpCsr = packed struct(u32) {
+    page_number: u31,
+    enable_sv32: bool,
+
+    fn from_page_directory(page_directory: *[page_table_size]PageTableEntry) u32 {
+        const page_number: u32 = @intFromPtr(page_directory.ptr) / page_size_bytes;
+        return @bitCast(SatpCsr{
+            .page_number = @intCast(page_number),
+            .enable_sv32 = true,
+        });
+    }
+};
+
+/// Map a virtual address to a physical address.
+///
+/// There are 1024 entries in a page directory, a.k.a. the first-level page table. That is, it is
+/// one page in size (4096 bytes): 1024 32-bit entries. Each entry points to a (second-level) page
+/// table that also contains 1024 entries (another 4096 bytes). Each of those entries hold the
+/// physical address of a page.
+fn map_page(
+    page_directory: *[page_table_size]PageTableEntry,
+    vaddr: u32,
+    paddr: u32,
+    flags: PageTableEntry.Flags,
+) void {
+    if (vaddr % page_size_bytes != 0) std.debug.panic("unaligned vaddr ({})", .{vaddr});
+    if (paddr % page_size_bytes != 0) std.debug.panic("unaligned paddr ({})", .{paddr});
+
+    const virtual_address: VirtualAddress = @bitCast(vaddr);
+    const vpn0 = virtual_address.vpn0;
+    const vpn1 = virtual_address.vpn1;
+
+    // Ensure the page directory entry has been initialised: the page table it points to has been
+    // allocated. Page tables are one page in size. Allocated pages are already cleared to zero.
+    if (!page_directory[vpn1].valid) page_directory[vpn1] = .from_address(
+        @intFromPtr(alloc_pages(1).ptr),
+        .{
+            .readable = false,
+            .writable = false,
+            .executable = false,
+            .user = false,
+        },
+    );
+
+    // Map the VPN to the PPN in the page table entry.
+    const page_table = page_directory[vpn1].page_table();
+    page_table[vpn0] = .from_address(paddr, flags);
 }
