@@ -32,6 +32,7 @@
             zig
             zls
             qemu
+            lldb
             llvmPackages.bintools-unwrapped
           ];
         };
