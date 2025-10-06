@@ -47,12 +47,24 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
 
+    // Easy way to print disassembly with colour. I use it like this:
+    // - zig build objdump | less -R  # browse all disassembly (-R -> --raw-control-characters)
+    // - zig build objdump -- --disassemble-symbols=kernel_main
+    const objdump_step = b.step("objdump", "Show disassembly (accepts args) (pipe me into )");
+    const objdump_cmd = b.addSystemCommand(&.{
+        "llvm-objdump",
+        "--disassembler-color=on",
+        "--disassemble-all",
+    });
+    objdump_cmd.addArtifactArg(exe);
+    if (b.args) |args| objdump_cmd.addArgs(args);
+    objdump_step.dependOn(&objdump_cmd.step);
+
     const debug_step = b.step("debug", "Run in QEMU, open GDB port, and await connection");
     const debug_cmd = b.addSystemCommand(&qemu_argv);
-    debug_cmd.addArgs(&.{ "-gdb", "tcp::1234", "-S" }); // debug args
+    debug_cmd.addArgs(&.{ "-S", "-gdb", "tcp::1234" }); // stall CPU and wait for gdb connection
     debug_cmd.addArg("-kernel");
     debug_cmd.addArtifactArg(exe);
-    debug_step.dependOn(b.getInstallStep());
     debug_step.dependOn(&debug_cmd.step);
 
     const lldb_step = b.step("lldb", "Run LLDB, attach to QEMU");
@@ -60,4 +72,18 @@ pub fn build(b: *std.Build) void {
     lldb_cmd.addPrefixedArtifactArg("target create ", exe);
     lldb_cmd.addArgs(&.{ "-o", "gdb-remote localhost:1234" });
     lldb_step.dependOn(&lldb_cmd.step);
+
+    // Given a sequence of addresses, print the source locations and the code (e.g. to print a stack
+    // or error trace).
+    const symbolizer_step = b.step("symbolizer", "Resolve symbols from addresses (requires args)");
+    const symbolizer_cmd = b.addSystemCommand(&.{
+        "llvm-symbolizer",
+        "--addresses",
+        "--pretty-print",
+        "--color=always",
+        "--print-source-context-lines=3",
+    });
+    symbolizer_cmd.addPrefixedArtifactArg("--obj=", exe);
+    if (b.args) |args| symbolizer_cmd.addArgs(args);
+    symbolizer_step.dependOn(&symbolizer_cmd.step);
 }
