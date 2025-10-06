@@ -29,9 +29,12 @@
 // Table 18.2: RISC-V calling convention register usage.
 
 // TODO:
-// - Get assertions working (we're using ReleaseSmall).
-// - Unreachable should print something sensible? I assume it doesn't because we've redefined panic.
-// - Get backtraces working.
+// - Implement stack traces.
+// - Make sure error traces are working.
+// - Get assertions working.
+// - Does unreachable print something sensible?
+// - Use std.log instead of console.print
+// - Why doesn't Debug mode work?
 
 const std = @import("std");
 
@@ -79,14 +82,12 @@ fn main() !void {
     }
 
     {
-        //
         process_idle = create_process(undefined);
         process_current = process_idle;
 
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
 
-        //
         yield();
 
         @panic("Switched to idle process!\n");
@@ -135,18 +136,24 @@ pub fn sbi_call(
 
 // SERIAL CONSOLE
 
-fn write_fn(_: *const anyopaque, bytes: []const u8) !usize {
-    for (bytes) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
-    return bytes.len;
-}
+const Console = struct {
+    interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
-const console: std.io.AnyWriter = .{
-    .context = undefined,
-    .writeFn = write_fn,
+    fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
+        var len: usize = 0;
+        for (data) |slice| {
+            for (slice) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
+            len += slice.len;
+        }
+        return len;
+    }
 };
 
 /// The panic handler. Just prints the message to the console and stalls the program. By default Zig
 /// uses the panic handler defined in the root of the executable.
+const console_concrete = Console{};
+var console = console_concrete.interface;
+
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
