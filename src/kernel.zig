@@ -29,7 +29,6 @@
 // Table 18.2: RISC-V calling convention register usage.
 
 // TODO:
-// - Implement stack traces.
 // - Make sure error traces are working.
 // - Get assertions working.
 // - Does unreachable print something sensible?
@@ -156,13 +155,29 @@ var console = console_concrete.interface;
 
 pub fn panic(
     msg: []const u8,
-    error_return_trace: ?*std.builtin.StackTrace,
-    ret_addr: ?usize,
+    _: ?*std.builtin.StackTrace,
+    return_address: ?usize,
 ) noreturn {
-    _ = error_return_trace;
-    _ = ret_addr;
+    @branchHint(.cold);
 
-    console.print("PANIC: {s}", .{msg}) catch {};
+    console.print("PANIC: '{s}'", .{msg}) catch {};
+    if (return_address) |ra| {
+        console.print(" at 0x{x}. ", .{ra}) catch {};
+        // TODO: Why is this return address different?
+        // var iterator = std.debug.StackIterator.init(@returnAddress(), null);
+        var iterator = std.debug.StackIterator.init(ra, null);
+        console.print(
+            \\Inspect the stack trace with:
+            \\
+            \\zig build symbolizer --
+        , .{}) catch {};
+        while (iterator.next()) |frame| console.print(
+            \\ \
+            \\  0x{X:0>8}
+        , .{frame}) catch {};
+        console.print("\n\n", .{}) catch {};
+    }
+
     while (true) asm volatile ("");
 }
 
