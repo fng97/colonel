@@ -86,8 +86,6 @@ fn main() !void {
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
 
-        // try fallible();
-
         yield();
 
         @panic("Switched to idle process!\n");
@@ -140,11 +138,8 @@ const Console = struct {
     interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
     fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
-        // FIXME: Leaving these checks in for now. See https://github.com/fng97/colonel/pull/1.
-        if (@intFromPtr(data.ptr) == 0) @panic("drain called with null data!");
         var len: usize = 0;
         for (data) |slice| {
-            if (@intFromPtr(slice.ptr) == 0) @panic("drain called with null slice!");
             for (slice) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
             len += slice.len;
         }
@@ -154,14 +149,6 @@ const Console = struct {
 
 const console_concrete = Console{}; // implements std.Io.Writer
 var console = console_concrete.interface;
-
-noinline fn fail() !void {
-    if (true) return error.TestError;
-}
-
-noinline fn fallible() !void {
-    try fail();
-}
 
 pub const panic = std.debug.FullPanic(struct {
     /// Global panic handler. This prints the panic message, generates a command to print a
@@ -467,7 +454,7 @@ fn create_process(entrypoint: *const anyopaque) *Process {
 /// Search for a runnable process, starting with the next process (pid + 1) and ending with the
 /// current process. This is the "round robin" scheduling approach. If no processes are runnable
 /// switch to the idle process.
-noinline fn yield() void {
+fn yield() void {
     // Process.pid is also the index of the process so we can loop through pid offsets (wrapping
     // around with % process.len) until we've checked all the processes including the current
     // process.
@@ -494,12 +481,11 @@ noinline fn yield() void {
     switch_context(&previous.sp, &process_next.sp);
 }
 
-/// Context switch between processes. Saves the current process's registers onto the kernel-reserved
-/// space on its stack, swaps the stack pointers, then restores the next process's registers from
-/// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
-/// local variables on it's stack (Process.stack).
-noinline fn switch_context(sp_addr_prev: *usize, sp_addr_next: *usize) void {
-    @setRuntimeSafety(false); // prevent error trace propagation between contexts
+/// Context switch: save the current process's callee-saved registers (s0-s11 and ra) to its stack,
+/// swap the stack pointers, then restore the next process's callee-saved registers from its stack.
+/// This function is naked because it contains a ret instruction that returns to a different
+/// location than where it was called from, which would be undefined behaviour in a normal function.
+fn switch_context_naked() callconv(.naked) void {
     asm volatile (
     // Allocate space for 13 4-byte registers.
         \\addi sp, sp, -13 * 4
@@ -519,9 +505,9 @@ noinline fn switch_context(sp_addr_prev: *usize, sp_addr_next: *usize) void {
         \\sw s10, 11 * 4(sp)
         \\sw s11, 12 * 4(sp)
 
-        // Switch the stack pointer.
-        \\sw sp, (%[sp_addr_prev]) // *sp_addr_prev = sp
-        \\lw sp, (%[sp_addr_next]) // sp = *sp_addr_next
+        // Switch the stack pointer. See arguments passed to switch_context.
+        \\sw sp, (a0) // *sp_addr_prev = sp
+        \\lw sp, (a1) // sp = *sp_addr_next
 
         // Restore next process's registers from its stack.
         \\lw ra,  0  * 4(sp)
@@ -542,17 +528,17 @@ noinline fn switch_context(sp_addr_prev: *usize, sp_addr_next: *usize) void {
         // stack pointer to where it was before yielding execution and return.
         \\addi sp, sp, 13 * 4
         \\ret
-        :
-        : [sp_addr_prev] "r" (sp_addr_prev),
-          [sp_addr_next] "r" (sp_addr_next),
     );
 }
 
+/// Cast switch_context_naked to the right calling convention.
+const switch_context = @as(*const fn (*usize, *usize) callconv(.c) void, @ptrCast(&switch_context_naked));
+
 fn delay() void {
-    for (0..1_000_000_000) |_| asm volatile ("nop");
+    for (0..500_000_000) |_| asm volatile ("nop");
 }
 
-export fn process_a_entry() void {
+fn process_a_entry() void {
     console.print("Starting process A\n", .{}) catch {};
     while (true) {
         console.print("A\n", .{}) catch {};
@@ -561,13 +547,10 @@ export fn process_a_entry() void {
     }
 }
 
-export fn process_b_entry() void {
+fn process_b_entry() void {
     console.print("Starting process B\n", .{}) catch {};
     while (true) {
         console.print("B\n", .{}) catch unreachable;
-
-        fallible() catch @panic("fallible() failed");
-
         delay();
         yield();
     }
