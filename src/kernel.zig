@@ -30,8 +30,6 @@
 
 // TODO:
 // - Get assertions working.
-// - Use std.log instead of console.print and make it infallible.
-// - Why doesn't Debug mode work?
 // - Add stack overflow protection.
 // - Print program size on build.
 
@@ -69,14 +67,14 @@ fn main() !void {
 
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
-    try console.print("\n\nHello {s}\n\n", .{"Kernel!"});
+    log.debug("Hello {s}\n", .{"Kernel!"});
 
     {
         const page1 = alloc_pages(2);
         const page2 = alloc_pages(1);
 
-        try console.print("alloc_pages test: page1={*} ({})\n", .{ page1.ptr, page1.len });
-        try console.print("alloc_pages test: page2={*} ({})\n", .{ page2.ptr, page2.len });
+        log.debug("alloc_pages test: page1={*} ({})\n", .{ page1.ptr, page1.len });
+        log.debug("alloc_pages test: page2={*} ({})\n", .{ page2.ptr, page2.len });
     }
 
     {
@@ -146,15 +144,40 @@ const Console = struct {
         return len;
     }
 };
+var console: Console = .{}; // implements std.Io.Writer;
 
-const console_concrete = Console{}; // implements std.Io.Writer
-var console = console_concrete.interface;
+const log = std.log.scoped(.kern);
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = struct {
+        pub fn log(
+            comptime level: std.log.Level,
+            comptime scope: @TypeOf(.EnumLiteral),
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            const writer: *std.io.Writer = &console.interface;
+            writer.print("[{s}][{s}] ", .{ @tagName(scope), switch (level) {
+                .err => "err",
+                .info => "inf",
+                .warn => "wrn",
+                .debug => "dbg",
+            } }) catch unreachable;
+            writer.print(format, args) catch unreachable;
+        }
+    }.log,
+};
 
 pub const panic = std.debug.FullPanic(struct {
+    // FIXME: Remove me when we get proper stack/error traces.
+    /// Pointer to the console's writer. We'll use this to extend the `log.err` call rather than
+    /// preallocating a buffer, `bufPrint`ing, and logging that.
+    const w: *std.io.Writer = &console.interface;
+
     /// Global panic handler. This prints the panic message, generates a command to print a
     /// stack/error trace, then hangs.
     fn panic_handler(msg: []const u8, return_address: ?usize) noreturn {
-        console.print("PANIC: {s}.", .{msg}) catch {};
+        log.err("PANIC: {s}.", .{msg});
 
         // TODO: Disable interrupts?
         // TODO: Detect double panics?
@@ -168,11 +191,11 @@ pub const panic = std.debug.FullPanic(struct {
         // zig build symbolizer -- {space-delimited addresses}
         const error_trace = @errorReturnTrace();
         if (error_trace != null or return_address != null) {
-            console.print(" Inspect stack trace with:\n\n  zig build symbolizer --", .{}) catch {};
+            w.print(" Inspect stack trace with:\n\n  zig build symbolizer --", .{}) catch {};
 
             if (error_trace) |trace| {
                 const trace_index = @min(trace.index, trace.instruction_addresses.len);
-                for (0..trace_index) |i| console.print(
+                for (0..trace_index) |i| w.print(
                     " 0x{X:0>8}",
                     .{trace.instruction_addresses[i]},
                 ) catch {};
@@ -180,10 +203,10 @@ pub const panic = std.debug.FullPanic(struct {
 
             if (return_address) |ra| {
                 var iterator = std.debug.StackIterator.init(ra, null);
-                while (iterator.next()) |address| console.print(" 0x{X:0>8}", .{address}) catch {};
+                while (iterator.next()) |address| w.print(" 0x{X:0>8}", .{address}) catch {};
             }
 
-            console.print("\n\n", .{}) catch {};
+            w.print("\n\n", .{}) catch {};
         }
 
         while (true) asm volatile ("");
@@ -539,18 +562,18 @@ fn delay() void {
 }
 
 fn process_a_entry() void {
-    console.print("Starting process A\n", .{}) catch {};
+    log.debug("Starting process A\n", .{});
     while (true) {
-        console.print("A\n", .{}) catch {};
+        log.debug("A\n", .{});
         delay();
         yield();
     }
 }
 
 fn process_b_entry() void {
-    console.print("Starting process B\n", .{}) catch {};
+    log.debug("Starting process B\n", .{});
     while (true) {
-        console.print("B\n", .{}) catch unreachable;
+        log.debug("B\n", .{});
         delay();
         yield();
     }
