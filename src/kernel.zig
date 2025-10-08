@@ -29,11 +29,11 @@
 // Table 18.2: RISC-V calling convention register usage.
 
 // TODO:
-// - Make sure error traces are working.
 // - Get assertions working.
-// - Does unreachable print something sensible?
-// - Use std.log instead of console.print
+// - Use std.log instead of console.print and make it infallible.
 // - Why doesn't Debug mode work?
+// - Add stack overflow protection.
+// - Print program size on build.
 
 const std = @import("std");
 
@@ -56,14 +56,13 @@ export fn boot() linksection(".text.boot") callconv(.naked) void {
 }
 
 /// The kernel main function called by boot. This just calls main. Because boot uses inline assembly
-/// to jump here and the C ABI doesn't speak Zig errors we just use this function to bridge the gap.
-/// We catch and print any errors here so that we can use `try` in main.
+/// to jump here and the ABI doesn't know how to handle returned Zig's errors we just use this
+/// function to bridge the gap. We catch and print any errors here so that we can use try in main.
 export fn kernel_main() noreturn {
-    main() catch |err| std.debug.panic("{s}\n", .{@errorName(err)});
+    main() catch |err| std.debug.panic("main returned {s}", .{@errorName(err)});
     unreachable;
 }
 
-/// The kernel main function.
 fn main() !void {
     // Ensure the bss section is cleared to zero.
     @memset(bss[0 .. bss_end - bss], 0);
@@ -86,6 +85,8 @@ fn main() !void {
 
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
+
+        // try fallible();
 
         yield();
 
@@ -139,8 +140,11 @@ const Console = struct {
     interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
     fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
+        // FIXME: Leaving these checks in for now. See https://github.com/fng97/colonel/pull/1.
+        if (@intFromPtr(data.ptr) == 0) @panic("drain called with null data!");
         var len: usize = 0;
         for (data) |slice| {
+            if (@intFromPtr(slice.ptr) == 0) @panic("drain called with null slice!");
             for (slice) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
             len += slice.len;
         }
@@ -148,38 +152,56 @@ const Console = struct {
     }
 };
 
-/// The panic handler. Just prints the message to the console and stalls the program. By default Zig
-/// uses the panic handler defined in the root of the executable.
-const console_concrete = Console{};
+const console_concrete = Console{}; // implements std.Io.Writer
 var console = console_concrete.interface;
 
-pub fn panic(
-    msg: []const u8,
-    _: ?*std.builtin.StackTrace,
-    return_address: ?usize,
-) noreturn {
-    @branchHint(.cold);
-
-    console.print("PANIC: '{s}'", .{msg}) catch {};
-    if (return_address) |ra| {
-        console.print(" at 0x{x}. ", .{ra}) catch {};
-        // TODO: Why is this return address different?
-        // var iterator = std.debug.StackIterator.init(@returnAddress(), null);
-        var iterator = std.debug.StackIterator.init(ra, null);
-        console.print(
-            \\Inspect the stack trace with:
-            \\
-            \\zig build symbolizer --
-        , .{}) catch {};
-        while (iterator.next()) |frame| console.print(
-            \\ \
-            \\  0x{X:0>8}
-        , .{frame}) catch {};
-        console.print("\n\n", .{}) catch {};
-    }
-
-    while (true) asm volatile ("");
+noinline fn fail() !void {
+    if (true) return error.TestError;
 }
+
+noinline fn fallible() !void {
+    try fail();
+}
+
+pub const panic = std.debug.FullPanic(struct {
+    /// Global panic handler. This prints the panic message, generates a command to print a
+    /// stack/error trace, then hangs.
+    fn panic_handler(msg: []const u8, return_address: ?usize) noreturn {
+        console.print("PANIC: {s}.", .{msg}) catch {};
+
+        // TODO: Disable interrupts?
+        // TODO: Detect double panics?
+
+        // Printing a stack trace is not trivial. See:
+        // https://andrewkelley.me/post/zig-stack-traces-kernel-panic-bare-bones-os.html. Instead,
+        // we let llvm-symbolizer do all the heavy lifting: given the list of addresses in our stack
+        // trace it prints one for us. Using a zig build entrypoint ensures llvm-symbolizer is
+        // passed our executable. The panic handler prints the list of addresses so that it's a one
+        // liner for the user to copy:
+        // zig build symbolizer -- {space-delimited addresses}
+        const error_trace = @errorReturnTrace();
+        if (error_trace != null or return_address != null) {
+            console.print(" Inspect stack trace with:\n\n  zig build symbolizer --", .{}) catch {};
+
+            if (error_trace) |trace| {
+                const trace_index = @min(trace.index, trace.instruction_addresses.len);
+                for (0..trace_index) |i| console.print(
+                    " 0x{X:0>8}",
+                    .{trace.instruction_addresses[i]},
+                ) catch {};
+            }
+
+            if (return_address) |ra| {
+                var iterator = std.debug.StackIterator.init(ra, null);
+                while (iterator.next()) |address| console.print(" 0x{X:0>8}", .{address}) catch {};
+            }
+
+            console.print("\n\n", .{}) catch {};
+        }
+
+        while (true) asm volatile ("");
+    }
+}.panic_handler);
 
 // TRAP HANDLER
 
@@ -477,6 +499,7 @@ noinline fn yield() void {
 /// its kernel-reserved stack space. That is, a process's execution context is stored as temporary
 /// local variables on it's stack (Process.stack).
 noinline fn switch_context(sp_addr_prev: *usize, sp_addr_next: *usize) void {
+    @setRuntimeSafety(false); // prevent error trace propagation between contexts
     asm volatile (
     // Allocate space for 13 4-byte registers.
         \\addi sp, sp, -13 * 4
@@ -530,18 +553,21 @@ fn delay() void {
 }
 
 export fn process_a_entry() void {
-    console.print("\nStarting process A\n", .{}) catch {};
+    console.print("Starting process A\n", .{}) catch {};
     while (true) {
-        console.print("A", .{}) catch {};
+        console.print("A\n", .{}) catch {};
         delay();
         yield();
     }
 }
 
 export fn process_b_entry() void {
-    console.print("\nStarting process B\n", .{}) catch {};
+    console.print("Starting process B\n", .{}) catch {};
     while (true) {
-        console.print("B", .{}) catch {};
+        console.print("B\n", .{}) catch unreachable;
+
+        fallible() catch @panic("fallible() failed");
+
         delay();
         yield();
     }
