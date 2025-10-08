@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/kernel.zig"),
         .target = b.resolveTargetQuery(.{
@@ -8,7 +10,7 @@ pub fn build(b: *std.Build) void {
             .os_tag = .freestanding,
             .abi = .none,
         }),
-        .optimize = .ReleaseSafe,
+        .optimize = optimize,
         .strip = false, // keep debug symbols
         .omit_frame_pointer = false, // for better debuggability
         .error_tracing = true,
