@@ -8,10 +8,10 @@ pub fn build(b: *std.Build) void {
             .os_tag = .freestanding,
             .abi = .none,
         }),
-        // Was originally using ReleaseSmall. However, ReleaseSafe makes more sense for development.
-        // However, it generates a lot more code. Switch to ReleaseSmall when inspecting assembly.
         .optimize = .ReleaseSafe,
         .strip = false, // keep debug symbols
+        .omit_frame_pointer = false, // for better debuggability
+        .error_tracing = true,
     });
 
     const exe = b.addExecutable(.{ .name = "kernel.elf", .root_module = mod });
