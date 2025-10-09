@@ -34,6 +34,7 @@
 // - Print program size on build.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Symbols from the linker script.
 const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" }); // start of kernel memory
@@ -83,6 +84,8 @@ fn main() !void {
 
         _ = create_process(&process_a_entry);
         _ = create_process(&process_b_entry);
+
+        // if (true) return error.TestError;
 
         yield();
 
@@ -168,6 +171,127 @@ pub const std_options: std.Options = .{
     }.log,
 };
 
+// Copied from mlugg's example
+// ------------------------------------------------------------------------------------------------
+
+pub const debug = struct {
+    /// This is the allocator which `std.debug` will use to allocate debug info. On freestanding you
+    /// usually just want to use a `std.heap.FixedBufferAllocator` for this---unless you have a proper
+    /// memory manager working of course!
+    pub fn getDebugInfoAllocator() std.mem.Allocator {
+        const Global = struct {
+            /// If you see OOM errors in stack traces, try increasing the size of this buffer. This is
+            /// 16 MiB, which is about 4x what ClashOS has been observed to use. The amount of memory is
+            /// large because `std.debug.Dwarf` caches all line number information.
+            var buf: [16 * 1024 * 1024]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&buf);
+        };
+        return Global.fba.allocator();
+    }
+
+    const source_files: []const []const u8 = &.{
+        // list of file names (under `src`) here. e.g.
+        "kernel.zig",
+    };
+    /// Implements the printing of the actual source line in the stack traces. Returning
+    /// successfully means we printed the line, so the stack tracing logic will print the column
+    /// indicator ('^') below it. Returning any error means we didn't print the line so the
+    /// indicator is omitted.
+    pub fn printLineFromFile(w: *std.Io.Writer, sl: std.debug.SourceLocation) !void {
+        const file_contents = inline for (source_files) |path| {
+            if (std.mem.endsWith(u8, sl.file_name, "src/" ++ path)) break @embedFile(path);
+        } else return error.FileNotFound;
+        var it = std.mem.splitScalar(u8, file_contents, '\n');
+        for (1..@intCast(sl.line)) |_| {
+            _ = it.next() orelse return error.EndOfFile;
+        }
+        try w.writeAll(it.next() orelse return error.EndOfFile);
+        try w.writeByte('\n');
+    }
+
+    /// This is the API which `std.debug` will call into to query the debug information.
+    pub const SelfInfo = struct {
+        /// The standard library's handling of DWARF (the most commonly used debug information format)
+        /// is pretty handy: it works fine on freestanding provided we just give it the raw data! This
+        /// field will be `null` at first and we'll populate it once we're queried for anything.
+        dwarf: ?std.debug.Dwarf,
+
+        pub const init: SelfInfo = .{ .dwarf = null };
+        pub fn deinit(si: *SelfInfo, gpa: std.mem.Allocator) void {
+            if (si.dwarf) |*dwarf| dwarf.deinit(gpa);
+        }
+
+        /// This is asking for the module name to print next to an address if full debug info isn't
+        /// available ("module" here means the name of the executable or shared library image). It can
+        /// be whatever you want, doesn't really matter; I'd just set it to the project name.
+        pub fn getModuleName(_: *SelfInfo, _: std.mem.Allocator, _: usize) std.debug.SelfInfoError![]const u8 {
+            return "kernel";
+        }
+
+        /// This is the actual interesting function, which is asking what the source location of an
+        /// instruction address is. We just need to initialize the `dwarf` field if not already done,
+        /// and then call a method on it which finds this for us.
+        pub fn getSymbol(si: *SelfInfo, gpa: std.mem.Allocator, address: usize) std.debug.SelfInfoError!std.debug.Symbol {
+            if (si.dwarf == null) si.dwarf = try initDwarf(gpa);
+            return si.dwarf.?.getSymbol(gpa, builtin.target.cpu.arch.endian(), address) catch |err| switch (err) {
+                error.InvalidDebugInfo,
+                error.MissingDebugInfo,
+                error.OutOfMemory,
+                => |e| return e,
+                error.ReadFailed,
+                error.EndOfStream,
+                error.Overflow,
+                error.StreamTooLong,
+                => return error.InvalidDebugInfo,
+            };
+        }
+
+        pub const can_unwind = false;
+    };
+
+    fn initDwarf(gpa: std.mem.Allocator) std.debug.SelfInfoError!std.debug.Dwarf {
+        // DWARF debugging information is split across different sections in the binary. We need to tell
+        // `std.debug.Dwarf` where each one of those is; we'll loop over the section names to populate
+        // each element of this `sections` array.
+        var dwarf: std.debug.Dwarf = .{ .sections = undefined };
+        inline for (@typeInfo(std.debug.Dwarf.Section.Id).@"enum".fields) |f| {
+            // `section` is the actual interesting function here; it's defined just below. Don't mind
+            // this `owned` thing, it's dumb and should be changed (see #25418).
+            dwarf.sections[f.value] = if (section(f.name)) |bytes| .{
+                .data = bytes,
+                .owned = false,
+            } else null;
+        }
+        // `open` is a really badly named method; it basically scans the debug information to compute
+        // some caches and lookup tables. We need to call it before we actually use `dwarf`.
+        dwarf.open(gpa, builtin.cpu.arch.endian()) catch |err| switch (err) {
+            error.InvalidDebugInfo, error.MissingDebugInfo, error.OutOfMemory => |e| return e,
+            else => return error.InvalidDebugInfo,
+        };
+        return dwarf;
+    }
+    /// Here, we want to return a slice which refers to the data in the DWARF section named `name`. This
+    /// is where things get a little tricky. These sections aren't normally made directly available to
+    /// the binary, because they aren't loaded into memory. To get access to them at runtime, we need to
+    /// do some trickery in our build logic. Ideally that trickery should just be in the linker script,
+    /// but linker scripts are really terrible, so we're also going to need some extra stuff. The result
+    /// will be that for every section we're interested in, two symbols are exposed, which tell us where
+    /// the data has been put. For instance, for the section named `.debug_info`:
+    ///
+    /// * The symbol `__debug_info` will be a pointer to the start of the section data
+    /// * The symbol `__debug_info_len` will be the length in bytes of the section data
+    ///
+    /// So, this function just needs to look at those two symbols with `@extern`.
+    fn section(comptime name: []const u8) ?[]const u8 {
+        const start = @extern([*]u8, .{ .name = "__" ++ name });
+        const len = @intFromPtr(@extern(*anyopaque, .{ .name = "__" ++ name ++ "_len" }));
+        if (len == 0) return null;
+        return start[0..len];
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+
 pub const panic = std.debug.FullPanic(struct {
     // FIXME: Remove me when we get proper stack/error traces.
     /// Pointer to the console's writer. We'll use this to extend the `log.err` call rather than
@@ -176,7 +300,8 @@ pub const panic = std.debug.FullPanic(struct {
 
     fn print_space_delimited_addresses(st: *const std.builtin.StackTrace) void {
         const index = @min(st.index, st.instruction_addresses.len);
-        for (0..index) |i| w.print(" 0x{X:0>8}", .{st.instruction_addresses[i]}) catch {};
+        for (0..index) |i| w.print(" 0x{X:0>8}", .{st.instruction_addresses[i] - 1}) catch
+            unreachable;
     }
 
     /// Global panic handler. This prints the panic message, generates a command to print a
@@ -188,21 +313,25 @@ pub const panic = std.debug.FullPanic(struct {
     /// user to copy:
     /// zig build symbolizer -- {space-delimited addresses}
     fn panic_handler(msg: []const u8, return_address: ?usize) noreturn {
-        log.err("PANIC: {s}. Inspect stack trace with:\n\n  zig build symbolizer --", .{msg});
+        // log.err("PANIC: {s}. Inspect stack trace with:\n\n  zig build symbolizer --", .{msg});
+        log.err("PANIC: {s}\n", .{msg});
 
         // TODO: Disable interrupts?
         // TODO: Detect double panics?
 
-        if (@errorReturnTrace()) |st| print_space_delimited_addresses(st);
+        // if (@errorReturnTrace()) |st| print_space_delimited_addresses(st);
+        if (@errorReturnTrace()) |st|
+            if (st.index != 0) std.debug.writeStackTrace(st, w, .no_color) catch {};
 
         var addr_buf: [64]usize = undefined;
         const st = std.debug.captureCurrentStackTrace(.{
             .first_address = return_address orelse @returnAddress(),
             .allow_unsafe_unwind = true,
         }, &addr_buf);
-        print_space_delimited_addresses(&st);
+        // print_space_delimited_addresses(&st);
+        if (st.index != 0) std.debug.writeStackTrace(&st, w, .no_color) catch {};
 
-        w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
+        // w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
 
         while (true) asm volatile ("");
     }
@@ -570,7 +699,8 @@ fn process_b_entry() void {
     while (true) {
         log.debug("B\n", .{});
         delay();
-        yield();
+        @panic("TESTING!");
+        // yield();
     }
 }
 
@@ -649,8 +779,9 @@ const PageTableEntry = packed struct(u32) {
     /// on page directory entries.
     fn page_table(pte: PageTableEntry) *[page_table_size]PageTableEntry {
         // The page number must be widened from u22 to u32 to prevent overflow.
-        const page_number: u32 = pte.ppn;
-        return @ptrFromInt(page_number * page_size_bytes);
+        // const page_number: u32 = pte.ppn;
+        // return @ptrFromInt(page_number * page_size_bytes);
+        return @ptrFromInt(pte.ppn * page_size_bytes);
     }
 };
 
