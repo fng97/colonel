@@ -175,39 +175,31 @@ pub const panic = std.debug.FullPanic(struct {
     const w: *std.io.Writer = &console.interface;
 
     /// Global panic handler. This prints the panic message, generates a command to print a
-    /// stack/error trace, then hangs.
+    /// stack/error trace, then hangs. Printing a stack trace is not trivial. See:
+    /// https://andrewkelley.me/post/zig-stack-traces-kernel-panic-bare-bones-os.html. Instead, we
+    /// let llvm-symbolizer do all the heavy lifting: given the list of addresses in our stack trace
+    /// it prints one for us. Using a zig build entrypoint ensures llvm-symbolizer is passed our
+    /// executable. The panic handler prints the list of addresses so that it's a one liner for the
+    /// user to copy:
+    /// zig build symbolizer -- {space-delimited addresses}
     fn panic_handler(msg: []const u8, return_address: ?usize) noreturn {
-        log.err("PANIC: {s}.", .{msg});
+        log.err("PANIC: {s}. Inspect stack trace with:\n\n  zig build symbolizer --", .{msg});
 
         // TODO: Disable interrupts?
         // TODO: Detect double panics?
 
-        // Printing a stack trace is not trivial. See:
-        // https://andrewkelley.me/post/zig-stack-traces-kernel-panic-bare-bones-os.html. Instead,
-        // we let llvm-symbolizer do all the heavy lifting: given the list of addresses in our stack
-        // trace it prints one for us. Using a zig build entrypoint ensures llvm-symbolizer is
-        // passed our executable. The panic handler prints the list of addresses so that it's a one
-        // liner for the user to copy:
-        // zig build symbolizer -- {space-delimited addresses}
-        const error_trace = @errorReturnTrace();
-        if (error_trace != null or return_address != null) {
-            w.print(" Inspect stack trace with:\n\n  zig build symbolizer --", .{}) catch {};
-
-            if (error_trace) |trace| {
-                const trace_index = @min(trace.index, trace.instruction_addresses.len);
-                for (0..trace_index) |i| w.print(
-                    " 0x{X:0>8}",
-                    .{trace.instruction_addresses[i]},
-                ) catch {};
-            }
-
-            if (return_address) |ra| {
-                var iterator = std.debug.StackIterator.init(ra, null);
-                while (iterator.next()) |address| w.print(" 0x{X:0>8}", .{address}) catch {};
-            }
-
-            w.print("\n\n", .{}) catch {};
+        if (@errorReturnTrace()) |trace| {
+            const trace_index = @min(trace.index, trace.instruction_addresses.len);
+            for (0..trace_index) |i| w.print(
+                " 0x{X:0>8}",
+                .{trace.instruction_addresses[i]},
+            ) catch {};
         }
+
+        var iter = std.debug.StackIterator.init(return_address orelse @returnAddress(), null);
+        while (iter.next()) |address| w.print(" 0x{X:0>8}", .{address}) catch {};
+
+        w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
 
         while (true) asm volatile ("");
     }
