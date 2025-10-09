@@ -3,7 +3,7 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05";
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zig-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    zls-overlay.url = "github:zigtools/zls?ref=0.15.0";
+    zls-overlay.url = "github:zigtools/zls";
     zls-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -19,7 +19,7 @@
               overlays = [
                 zig-overlay.overlays.default
                 (final: prev: {
-                  zig = final.zigpkgs."0.15.1";
+                  zig = final.zigpkgs.master;
                   zls = zls-overlay.packages.${system}.default;
                 })
               ];

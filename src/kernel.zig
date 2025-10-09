@@ -135,7 +135,7 @@ pub fn sbi_call(
 const Console = struct {
     interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
-    fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
+    fn drain(_: *std.Io.Writer, data: []const []const u8, _: usize) !usize {
         var len: usize = 0;
         for (data) |slice| {
             for (slice) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
@@ -156,7 +156,7 @@ pub const std_options: std.Options = .{
             comptime format: []const u8,
             args: anytype,
         ) void {
-            const writer: *std.io.Writer = &console.interface;
+            const writer: *std.Io.Writer = &console.interface;
             writer.print("[{s}][{s}] ", .{ @tagName(scope), switch (level) {
                 .err => "err",
                 .info => "inf",
@@ -172,7 +172,12 @@ pub const panic = std.debug.FullPanic(struct {
     // FIXME: Remove me when we get proper stack/error traces.
     /// Pointer to the console's writer. We'll use this to extend the `log.err` call rather than
     /// preallocating a buffer, `bufPrint`ing, and logging that.
-    const w: *std.io.Writer = &console.interface;
+    const w: *std.Io.Writer = &console.interface;
+
+    fn print_space_delimited_addresses(st: *const std.builtin.StackTrace) void {
+        const index = @min(st.index, st.instruction_addresses.len);
+        for (0..index) |i| w.print(" 0x{X:0>8}", .{st.instruction_addresses[i]}) catch {};
+    }
 
     /// Global panic handler. This prints the panic message, generates a command to print a
     /// stack/error trace, then hangs. Printing a stack trace is not trivial. See:
@@ -188,16 +193,14 @@ pub const panic = std.debug.FullPanic(struct {
         // TODO: Disable interrupts?
         // TODO: Detect double panics?
 
-        if (@errorReturnTrace()) |trace| {
-            const trace_index = @min(trace.index, trace.instruction_addresses.len);
-            for (0..trace_index) |i| w.print(
-                " 0x{X:0>8}",
-                .{trace.instruction_addresses[i]},
-            ) catch {};
-        }
+        if (@errorReturnTrace()) |st| print_space_delimited_addresses(st);
 
-        var iter = std.debug.StackIterator.init(return_address orelse @returnAddress(), null);
-        while (iter.next()) |address| w.print(" 0x{X:0>8}", .{address}) catch {};
+        var addr_buf: [64]usize = undefined;
+        const st = std.debug.captureCurrentStackTrace(.{
+            .first_address = return_address orelse @returnAddress(),
+            .allow_unsafe_unwind = true,
+        }, &addr_buf);
+        print_space_delimited_addresses(&st);
 
         w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
 
