@@ -55,8 +55,10 @@ pub fn build(b: *std.Build) void {
     const objdump_step = b.step("objdump", "Show disassembly (accepts args) (pipe me into )");
     const objdump_cmd = b.addSystemCommand(&.{
         "llvm-objdump",
+        "--source",
+        "--line-numbers",
         "--disassembler-color=on",
-        "--disassemble-all",
+        "--no-show-raw-insn",
     });
     objdump_cmd.addArtifactArg(exe);
     if (b.args) |args| objdump_cmd.addArgs(args);
