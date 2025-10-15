@@ -192,12 +192,12 @@ pub const panic = std.debug.FullPanic(struct {
             const trace_index = @min(trace.index, trace.instruction_addresses.len);
             for (0..trace_index) |i| w.print(
                 " 0x{X:0>8}",
-                .{trace.instruction_addresses[i]},
+                .{trace.instruction_addresses[i] - 1},
             ) catch {};
         }
 
         var iter = std.debug.StackIterator.init(return_address orelse @returnAddress(), null);
-        while (iter.next()) |address| w.print(" 0x{X:0>8}", .{address}) catch {};
+        while (iter.next()) |address| w.print(" 0x{X:0>8}", .{address - 1}) catch {};
 
         w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
 
