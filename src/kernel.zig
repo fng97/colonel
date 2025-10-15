@@ -35,6 +35,9 @@
 
 const std = @import("std");
 
+/// Embedded user binary built from `user.zig`.
+const user_bin = @embedFile("user.bin");
+
 // Symbols from the linker script.
 const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" }); // start of kernel memory
 const bss = @extern([*]u8, .{ .name = "__bss" });
@@ -68,6 +71,7 @@ fn main() !void {
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
     log.debug("Hello {s}\n", .{"Kernel!"});
+    log.debug("User binary is {d} bytes\n", .{user_bin.len});
 
     {
         const page1 = alloc_pages(2);
