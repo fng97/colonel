@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/user.zig"),
             .target = target_rv32,
             .optimize = optimize,
-            .strip = true, // kernel can't do anything with debug info
+            .strip = false, // TODO: What should this be?
             .omit_frame_pointer = false,
             .error_tracing = true,
         }),

@@ -85,8 +85,7 @@ fn main() !void {
         process_idle = create_process(undefined);
         process_current = process_idle;
 
-        _ = create_process(&process_a_entry);
-        _ = create_process(&process_b_entry);
+        _ = create_process(user_bin);
 
         yield();
 
@@ -427,7 +426,7 @@ var process_idle: *Process = undefined;
 /// saved.
 ///
 /// NOTE: The first process created must be the idle process (pid == 0) for yield() to work.
-fn create_process(entrypoint: *const anyopaque) *Process {
+fn create_process(image: []const u8) *Process {
     const process = for (&processes, 0..) |*process, pid| {
         if (process.state == .unused) {
             process.pid = pid;
@@ -445,15 +444,18 @@ fn create_process(entrypoint: *const anyopaque) *Process {
 
         const registers = stack[stack.len - 13 ..]; // 14 callee-saved registers (-1 for sp)
         for (registers[1..]) |*register| register.* = 0; // s0-s11
-        registers[0] = @intFromPtr(entrypoint); // ra
+        registers[0] = @intFromPtr(&user_entry); // ra
 
         break :blk registers;
     };
 
-    // Map all virtual addresses to physical addresses from the start of memory (krenel_base) to the
-    // end (ram_end).
-    const page = alloc_pages(1);
-    const page_directory: *[page_table_size]PageTableEntry = @ptrCast(@alignCast(page.ptr));
+    // Initialise a page directory for the process.
+    const page_directory_buffer = alloc_pages(1);
+    const page_directory: *[page_table_size]PageTableEntry =
+        @ptrCast(@alignCast(page_directory_buffer.ptr));
+
+    // Map kernel pages: from the start of memory (krenel_base) to the end (ram_end). Kernel virtual
+    // addresses are mapped to physical addresses for simplicity.
     var paddr: usize = @intFromPtr(&kernel_base[0]);
     while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes) {
         map_page(page_directory, paddr, paddr, .{
@@ -461,6 +463,26 @@ fn create_process(entrypoint: *const anyopaque) *Process {
             .writable = true,
             .executable = true,
             .user = false,
+        });
+    }
+
+    // Map user pages.
+    var pos: usize = 0;
+    while (pos < image.len) : (pos += page_size_bytes) {
+        const page = alloc_pages(1);
+
+        // Handle the case where the data to be copied is smaller than the page size.
+        const remaining = image.len - pos;
+        // TODO: @min()
+        const copy_size = if (page_size_bytes <= remaining) page_size_bytes else remaining;
+
+        // Fill and map the page.
+        @memcpy(page[0..copy_size], image[pos .. pos + copy_size]);
+        map_page(page_directory, user_base + pos, @intFromPtr(page.ptr), .{
+            .readable = true,
+            .writable = true,
+            .executable = true,
+            .user = true,
         });
     }
 
@@ -705,4 +727,33 @@ fn map_page(
     // Map the VPN to the PPN in the page table entry.
     const page_table = page_directory[vpn1].page_table();
     page_table[vpn0] = .from_address(paddr, flags);
+}
+
+// USER MODE
+
+/// The base virtual address of an application image. This needs to match the starting address
+/// defined in `user.ld`.
+const user_base = 0x1000000;
+
+/// TODO: I presume this sstatus is supervisor status.
+/// This enables user mode (U-mode).
+const sstatus_spie: u32 = 1 << 5;
+
+fn user_entry() callconv(.naked) void {
+    // FIXME: In this book, we don't use hardware interrupts but use polling instead, so it's not
+    // necessary to set the SPIE bit. However, it's better to be clear rather than silently ignoring
+    // interrupts.
+    asm volatile (
+    // Set the program counter for when transitioning to U-Mode in the sepc register. That is, where
+    // sret jumps to.
+        \\csrw sepc, %[sepc]
+        // Set the SPIE bit in the sstatus register. Setting this enables hardware interrupts when
+        // entering U-Mode, and the handler set in the stvec register will be called.
+        \\csrw sstatus, %[sstatus]
+        // The sret instruction transitions to the user mode if the SPP bit in sstatus is 0.
+        \\sret
+        :
+        : [sepc] "r" (user_base),
+          [sstatus] "r" (sstatus_spie),
+    );
 }
