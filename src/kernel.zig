@@ -34,6 +34,7 @@
 // - Print program size on build.
 
 const std = @import("std");
+const syscall = @import("syscall.zig");
 
 /// Embedded user binary built from `user.zig`.
 const user_bin = @embedFile("user.bin");
@@ -138,10 +139,14 @@ pub fn sbi_call(
 const Console = struct {
     interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
+    pub fn putchar(char: u8) void {
+        _ = sbi_call(char, 0, 0, 0, 0, 0, 0, 1);
+    }
+
     fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
         var len: usize = 0;
         for (data) |slice| {
-            for (slice) |c| _ = sbi_call(c, 0, 0, 0, 0, 0, 0, 1);
+            for (slice) |c| putchar(c);
             len += slice.len;
         }
         return len;
@@ -346,15 +351,31 @@ export fn kernel_entry() align(4) callconv(.naked) void {
     );
 }
 
-export fn handle_trap(_: *TrapFrame) void {
+// TODO: This should be an enum.
+const scause_ecall = 8;
+
+export fn handle_trap(trap_frame: *TrapFrame) void {
     const scause = read_csr("scause");
     const stval = read_csr("stval");
     const user_pc = read_csr("sepc");
 
-    std.debug.panic(
-        "Unexpected trap scause={x}, stval={x}, user_pc={x}\n",
-        .{ scause, stval, user_pc },
-    );
+    // Handle syscalls.
+    if (scause == scause_ecall) {
+        // Besides calling the handle_syscall function, we also add 4 (the size of ecall
+        // instruction) to the value of sepc. This is because sepc points to the program counter
+        // that caused the exception, which points to the ecall instruction. If we don't change it,
+        // the kernel goes back to the same place, and the ecall instruction is executed repeatedly.
+        write_csr("sepc", user_pc + 4);
+        switch (trap_frame.a3) { // the syscall type is passed in a3
+            syscall.sys_putchar => Console.putchar(@intCast(trap_frame.a0)),
+            else => |a3| std.debug.panic("Unexpected syscall: a3={x}", .{a3}),
+        }
+    } else {
+        std.debug.panic(
+            "Unexpected trap scause={x}, stval={x}, user_pc={x}\n",
+            .{ scause, stval, user_pc },
+        );
+    }
 }
 
 /// Read control and status register (CSR)

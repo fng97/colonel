@@ -1,4 +1,5 @@
 const std = @import("std");
+const syscall = @import("syscall.zig");
 
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
@@ -15,7 +16,10 @@ export fn start() linksection(".text.start") callconv(.naked) void {
 }
 
 fn main() void {
-    const bad_ptr: *usize = @ptrFromInt(0x80200000);
-    bad_ptr.* = 0x1234;
+    const greeting = "Hello from userland, world!";
+    for (greeting) |c| syscall.putchar(c);
     while (true) {}
 }
+
+// TODO: Where is the stop function?
+// TODO: Get stack traces working from userspace.
