@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const syscall = @import("syscall.zig");
+const common = @import("common.zig");
 
 /// Embedded user binary built from `user.zig`.
 const user_bin = @embedFile("user.bin");
@@ -90,7 +91,7 @@ fn main() !void {
 
         yield();
 
-        @panic("Switched to idle process!\n");
+        @panic("Switched to idle process!");
     }
 
     while (true) asm volatile ("");
@@ -98,61 +99,53 @@ fn main() !void {
 
 // SUPERVISOR BINARY INTERFACE (SBI) CALLS
 
-const SbiRet = struct {
-    err: usize,
-    value: usize,
+const Sbi = struct {
+    const Result = struct {
+        err: usize,
+        value: usize,
+    };
+
+    /// Perform an Environment Call (ECAll) using the Supervisor Binary Interface (SBI). This is
+    /// used to implement a syscall: a call from user mode to execute higher privileged code.
+    fn ecall(
+        arg0: usize,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+        arg4: usize,
+        arg5: usize,
+        fid: usize,
+        eid: usize,
+    ) Result {
+        var err: usize = undefined;
+        var value: usize = undefined;
+
+        asm volatile ("ecall"
+            : [err] "={a0}" (err),
+              [value] "={a1}" (value),
+            : [arg0] "{a0}" (arg0),
+              [arg1] "{a1}" (arg1),
+              [arg2] "{a2}" (arg2),
+              [arg3] "{a3}" (arg3),
+              [arg4] "{a4}" (arg4),
+              [arg5] "{a5}" (arg5),
+              [arg6] "{a6}" (fid),
+              [arg7] "{a7}" (eid),
+            : .{ .memory = true });
+
+        return .{ .err = err, .value = value };
+    }
+
+    pub fn putchar(char: u8) void {
+        _ = ecall(char, 0, 0, 0, 0, 0, 0, 1);
+    }
+
+    }
 };
-
-/// Perform an Environment Call (ECAll) using the Supervisor Binary Interface (SBI). This is used
-/// to implement a syscall: a call from user mode to execute higher privileged code.
-pub fn sbi_call(
-    arg0: usize,
-    arg1: usize,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-    arg5: usize,
-    fid: usize,
-    eid: usize,
-) SbiRet {
-    var err: usize = undefined;
-    var value: usize = undefined;
-
-    asm volatile ("ecall"
-        : [err] "={a0}" (err),
-          [value] "={a1}" (value),
-        : [arg0] "{a0}" (arg0),
-          [arg1] "{a1}" (arg1),
-          [arg2] "{a2}" (arg2),
-          [arg3] "{a3}" (arg3),
-          [arg4] "{a4}" (arg4),
-          [arg5] "{a5}" (arg5),
-          [arg6] "{a6}" (fid),
-          [arg7] "{a7}" (eid),
-        : .{ .memory = true });
-
-    return .{ .err = err, .value = value };
-}
 
 // SERIAL CONSOLE
 
-const Console = struct {
-    interface: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
-
-    pub fn putchar(char: u8) void {
-        _ = sbi_call(char, 0, 0, 0, 0, 0, 0, 1);
-    }
-
-    fn drain(_: *std.io.Writer, data: []const []const u8, _: usize) !usize {
-        var len: usize = 0;
-        for (data) |slice| {
-            for (slice) |c| putchar(c);
-            len += slice.len;
-        }
-        return len;
-    }
-};
-var console: Console = .{}; // implements std.Io.Writer;
+const console = common.Console{ .putchar = Sbi.putchar };
 
 const log = std.log.scoped(.kern);
 pub const std_options: std.Options = .{
@@ -164,32 +157,26 @@ pub const std_options: std.Options = .{
             comptime format: []const u8,
             args: anytype,
         ) void {
-            const writer: *std.io.Writer = &console.interface;
-            writer.print("[{s}][{s}] ", .{ @tagName(scope), switch (level) {
+            console.print("[{s}][{s}] ", .{ @tagName(scope), switch (level) {
                 .err => "err",
                 .info => "inf",
                 .warn => "wrn",
                 .debug => "dbg",
-            } }) catch unreachable;
-            writer.print(format, args) catch unreachable;
+            } });
+            console.print(format, args);
         }
     }.log,
 };
 
 pub const panic = std.debug.FullPanic(struct {
-    // FIXME: Remove me when we get proper stack/error traces.
-    /// Pointer to the console's writer. We'll use this to extend the `log.err` call rather than
-    /// preallocating a buffer, `bufPrint`ing, and logging that.
-    const w: *std.io.Writer = &console.interface;
-
     /// Global panic handler. This prints the panic message, generates a command to print a
-    /// stack/error trace, then hangs. Printing a stack trace is not trivial. See:
+    /// stack/error trace, then hangs. Printing a stack trace on freestanding is not trivial. See:
     /// https://andrewkelley.me/post/zig-stack-traces-kernel-panic-bare-bones-os.html. Instead, we
     /// let llvm-symbolizer do all the heavy lifting: given the list of addresses in our stack trace
     /// it prints one for us. Using a zig build entrypoint ensures llvm-symbolizer is passed our
     /// executable. The panic handler prints the list of addresses so that it's a one liner for the
     /// user to copy:
-    /// zig build symbolizer -- {space-delimited addresses}
+    /// zig build symbolizer -- {space-delimited-addresses}
     fn panic_handler(msg: []const u8, return_address: ?usize) noreturn {
         log.err("PANIC: {s}. Inspect stack trace with:\n\n  zig build symbolizer --", .{msg});
 
@@ -198,16 +185,16 @@ pub const panic = std.debug.FullPanic(struct {
 
         if (@errorReturnTrace()) |trace| {
             const trace_index = @min(trace.index, trace.instruction_addresses.len);
-            for (0..trace_index) |i| w.print(
+            for (0..trace_index) |i| console.print(
                 " 0x{X:0>8}",
                 .{trace.instruction_addresses[i] - 1},
-            ) catch {};
+            );
         }
 
         var iter = std.debug.StackIterator.init(return_address orelse @returnAddress(), null);
-        while (iter.next()) |address| w.print(" 0x{X:0>8}", .{address - 1}) catch {};
+        while (iter.next()) |address| console.print(" 0x{X:0>8}", .{address - 1});
 
-        w.print("\n\n", .{}) catch {}; // make some room so it's easy to copy the one-liner
+        console.print("\n\n", .{}); // make some room so it's easy to copy the one-liner
 
         while (true) asm volatile ("");
     }
@@ -367,12 +354,12 @@ export fn handle_trap(trap_frame: *TrapFrame) void {
         // the kernel goes back to the same place, and the ecall instruction is executed repeatedly.
         write_csr("sepc", user_pc + 4);
         switch (trap_frame.a3) { // the syscall type is passed in a3
-            syscall.sys_putchar => Console.putchar(@intCast(trap_frame.a0)),
+            @intFromEnum(syscall.Number.putchar) => Console.putchar(@intCast(trap_frame.a0)),
             else => |a3| std.debug.panic("Unexpected syscall: a3={x}", .{a3}),
         }
     } else {
         std.debug.panic(
-            "Unexpected trap scause={x}, stval={x}, user_pc={x}\n",
+            "Unexpected trap scause={x}, stval={x}, user_pc={x}",
             .{ scause, stval, user_pc },
         );
     }
@@ -453,7 +440,7 @@ fn create_process(image: []const u8) *Process {
             process.pid = pid;
             break process;
         }
-    } else @panic("No free process slots\n");
+    } else @panic("No free process slots");
 
     // Reserve space for the callee-saved registers on the stack. s0-s11 are zero-initialised and ra
     // is set to the process entrypoint. These will be restored in the first context switch. sp is
