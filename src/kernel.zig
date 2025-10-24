@@ -91,7 +91,7 @@ fn main() !void {
 
         yield();
 
-        @panic("Switched to idle process!");
+        @panic("Switched to idle process");
     }
 
     while (true) asm volatile ("");
@@ -101,8 +101,8 @@ fn main() !void {
 
 const Sbi = struct {
     const Result = struct {
-        err: usize,
-        value: usize,
+        err: isize,
+        value: isize,
     };
 
     /// Perform an Environment Call (ECAll) using the Supervisor Binary Interface (SBI). This is
@@ -117,8 +117,8 @@ const Sbi = struct {
         fid: usize,
         eid: usize,
     ) Result {
-        var err: usize = undefined;
-        var value: usize = undefined;
+        var err: isize = undefined;
+        var value: isize = undefined;
 
         asm volatile ("ecall"
             : [err] "={a0}" (err),
@@ -140,6 +140,13 @@ const Sbi = struct {
         _ = ecall(char, 0, 0, 0, 0, 0, 0, 1);
     }
 
+    pub fn getchar() u8 {
+        const ret = ecall(0, 0, 0, 0, 0, 0, 0, 2);
+        switch (ret.err) {
+            0...255 => |char| return @intCast(char),
+            -1 => @panic("getchar ecall failed"),
+            else => @panic("getchar ecall returned non-ascii value"),
+        }
     }
 };
 
@@ -353,16 +360,31 @@ export fn handle_trap(trap_frame: *TrapFrame) void {
         // that caused the exception, which points to the ecall instruction. If we don't change it,
         // the kernel goes back to the same place, and the ecall instruction is executed repeatedly.
         write_csr("sepc", user_pc + 4);
-        switch (trap_frame.a3) { // the syscall type is passed in a3
-            @intFromEnum(syscall.Number.putchar) => Console.putchar(@intCast(trap_frame.a0)),
-            else => |a3| std.debug.panic("Unexpected syscall: a3={x}", .{a3}),
+
+        // The syscall number is passed by argument in a0.
+        const syscall_number = std.meta.intToEnum(syscall.Number, trap_frame.a0) catch
+            std.debug.panic("Invalid syscall: {x}", .{trap_frame.a0});
+        switch (syscall_number) {
+            .putchar => Sbi.putchar(@intCast(trap_frame.a1)),
+            .getchar => getchar: while (true) {
+                const ret = Sbi.ecall(0, 0, 0, 0, 0, 0, 0, 2);
+                if (ret.err >= 0) {
+                    trap_frame.a0 = @intCast(ret.err); // return via a0
+                    break :getchar;
+                } else yield(); // so that IO doesn't block everything
+            },
+            // TODO: Free process resources on exit.
+            .exit => {
+                log.info("process {d} exited\n", .{process_current.pid});
+                process_current.state = .exited;
+                yield();
+                unreachable;
+            },
         }
-    } else {
-        std.debug.panic(
-            "Unexpected trap scause={x}, stval={x}, user_pc={x}",
-            .{ scause, stval, user_pc },
-        );
-    }
+    } else std.debug.panic(
+        "Unexpected trap scause={x}, stval={x}, user_pc={x}",
+        .{ scause, stval, user_pc },
+    );
 }
 
 /// Read control and status register (CSR)
@@ -408,7 +430,7 @@ fn alloc_pages(pages: usize) []u8 {
 const Process = struct {
     /// The conventional name for the process ID.
     pid: u32,
-    state: enum { unused, runnable },
+    state: enum { unused, runnable, exited },
     /// The conventional name for the stack pointer.
     sp: usize,
     /// Pointer to the first-level page table, the page directory.
