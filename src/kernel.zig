@@ -29,6 +29,7 @@
 // Table 18.2: RISC-V calling convention register usage.
 
 // TODO:
+// - Stack traces broke again.
 // - Get assertions working.
 // - Add stack overflow protection.
 // - Print program size on build.
@@ -67,34 +68,28 @@ export fn kernel_main() noreturn {
 }
 
 fn main() !void {
+    log.info("Welcome to Colonel\n", .{});
+
     // Ensure the bss section is cleared to zero.
+    log.debug("Clearing BSS\n", .{});
     @memset(bss[0 .. bss_end - bss], 0);
 
+    log.debug("Setting trap handler: {*}\n", .{&kernel_entry});
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
-    log.debug("Hello {s}\n", .{"Kernel!"});
-    log.debug("User binary is {d} bytes\n", .{user_bin.len});
+    log.info("Creating idle process\n", .{});
+    process_idle = create_process(undefined);
+    process_current = process_idle;
 
-    {
-        const page1 = alloc_pages(2);
-        const page2 = alloc_pages(1);
+    log.info(
+        "Creating user process: embedded user binary is at {*} ({d} bytes)\n",
+        .{ user_bin.ptr, user_bin.len },
+    );
+    _ = create_process(user_bin);
 
-        log.debug("alloc_pages test: page1={*} ({})\n", .{ page1.ptr, page1.len });
-        log.debug("alloc_pages test: page2={*} ({})\n", .{ page2.ptr, page2.len });
-    }
+    yield();
 
-    {
-        process_idle = create_process(undefined);
-        process_current = process_idle;
-
-        _ = create_process(user_bin);
-
-        yield();
-
-        @panic("Switched to idle process");
-    }
-
-    while (true) asm volatile ("");
+    @panic("Switched to idle process");
 }
 
 // SUPERVISOR BINARY INTERFACE (SBI) CALLS
@@ -156,7 +151,7 @@ const console = common.Console{ .putchar = Sbi.putchar };
 
 const log = std.log.scoped(.kern);
 pub const std_options: std.Options = .{
-    .log_level = .debug,
+    // .log_level = .debug,
     .logFn = struct {
         pub fn log(
             comptime level: std.log.Level,
@@ -422,6 +417,11 @@ fn alloc_pages(pages: usize) []u8 {
     @memset(result, 0);
     ram_used_bytes += alloc_size_bytes;
 
+    log.debug(
+        "Allocated {d} page(s): {*} ({} bytes), {} bytes memory remaining\n",
+        .{ pages, result.ptr, result.len, ram_available.len - alloc_size_bytes },
+    );
+
     return result;
 }
 
@@ -463,6 +463,7 @@ fn create_process(image: []const u8) *Process {
             break process;
         }
     } else @panic("No free process slots");
+    log.info("Initialising process {d}\n", .{process.pid});
 
     // Reserve space for the callee-saved registers on the stack. s0-s11 are zero-initialised and ra
     // is set to the process entrypoint. These will be restored in the first context switch. sp is
@@ -484,17 +485,18 @@ fn create_process(image: []const u8) *Process {
     const page_directory: *[page_table_size]PageTableEntry =
         @ptrCast(@alignCast(page_directory_buffer.ptr));
 
-    // Map kernel pages: from the start of memory (krenel_base) to the end (ram_end). Kernel virtual
+    // Map kernel pages: from the start of memory (kernel_base) to the end (ram_end). Kernel virtual
     // addresses are mapped to physical addresses for simplicity.
     var paddr: usize = @intFromPtr(&kernel_base[0]);
-    while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes) {
-        map_page(page_directory, paddr, paddr, .{
-            .readable = true,
-            .writable = true,
-            .executable = true,
-            .user = false,
-        });
-    }
+    const flags = PageTableEntry.Flags{
+        .readable = true,
+        .writable = true,
+        .executable = true,
+        .user = false,
+    };
+    log.debug("Mapping kernel pages: {f}\n", .{flags});
+    while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes)
+        map_page(page_directory, paddr, paddr, flags);
 
     // Map user pages.
     var pos: usize = 0;
@@ -535,6 +537,11 @@ fn yield() void {
     } else process_idle;
 
     if (process_next == process_current) return;
+
+    log.info(
+        "Context switch: process {d} -> {d}\n",
+        .{ process_current.pid, process_next.pid },
+    );
 
     asm volatile (
         \\sfence.vma
@@ -605,28 +612,6 @@ fn switch_context_naked() callconv(.naked) void {
 /// Cast switch_context_naked to the right calling convention.
 const switch_context = @as(*const fn (*usize, *usize) callconv(.c) void, @ptrCast(&switch_context_naked));
 
-fn delay() void {
-    for (0..500_000_000) |_| asm volatile ("nop");
-}
-
-fn process_a_entry() void {
-    log.debug("Starting process A\n", .{});
-    while (true) {
-        log.debug("A\n", .{});
-        delay();
-        yield();
-    }
-}
-
-fn process_b_entry() void {
-    log.debug("Starting process B\n", .{});
-    while (true) {
-        log.debug("B\n", .{});
-        delay();
-        yield();
-    }
-}
-
 // PAGE TABLE
 
 // NOTE: We're using Sv32 which (I think) stands for [S]upervisor-mode [V]irtual memory with 32-bit
@@ -687,6 +672,18 @@ const PageTableEntry = packed struct(u32) {
         executable: bool,
         user: bool, // accessible in user mode
         _: u5 = 0, // no idea what these do
+
+        pub fn format(flags: Flags, writer: *std.Io.Writer) !void {
+            try writer.print(
+                "{c}{c}{c}{c}",
+                .{
+                    @as(u8, if (flags.readable) 'r' else '-'),
+                    @as(u8, if (flags.writable) 'w' else '-'),
+                    @as(u8, if (flags.executable) 'x' else '-'),
+                    @as(u8, if (flags.user) 'u' else 'k'),
+                },
+            );
+        }
     };
 
     /// Create a valid page table entry from an address with the provided flags.
@@ -702,8 +699,8 @@ const PageTableEntry = packed struct(u32) {
     /// on page directory entries.
     fn page_table(pte: PageTableEntry) *[page_table_size]PageTableEntry {
         // The page number must be widened from u22 to u32 to prevent overflow.
-        const page_number: u32 = pte.ppn;
-        return @ptrFromInt(page_number * page_size_bytes);
+        // const page_number: u32 = pte.ppn;
+        return @ptrFromInt(pte.ppn * page_size_bytes);
     }
 };
 
@@ -744,15 +741,19 @@ fn map_page(
 
     // Ensure the page directory entry has been initialised: the page table it points to has been
     // allocated. Page tables are one page in size. Allocated pages are already cleared to zero.
-    if (!page_directory[vpn1].valid) page_directory[vpn1] = .from_address(
-        @intFromPtr(alloc_pages(1).ptr),
-        .{
-            .readable = false,
-            .writable = false,
-            .executable = false,
-            .user = false,
-        },
-    );
+    if (!page_directory[vpn1].valid) {
+        const addr = alloc_pages(1).ptr;
+        page_directory[vpn1] = .from_address(
+            @intFromPtr(addr),
+            .{
+                .readable = false,
+                .writable = false,
+                .executable = false,
+                .user = false,
+            },
+        );
+        log.debug("Page directory initialised. Starts at {*}\n", .{addr});
+    }
 
     // Map the VPN to the PPN in the page table entry.
     const page_table = page_directory[vpn1].page_table();
