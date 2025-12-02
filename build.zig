@@ -56,14 +56,12 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run in QEMU");
     const qemu_argv = .{
-        "qemu-system-riscv32",
-        "-machine",
-        "virt",
-        "-bios",
-        "default",
-        "-serial",
-        "mon:stdio",
-        "--no-reboot",
+        "qemu-system-riscv32", "--no-reboot",
+        "-machine",            "virt",
+        "-bios",               "default",
+        "-serial",             "mon:stdio",
+        "-drive",              "id=drive0,file=lorem.txt,format=raw,if=none",
+        "-device",             "virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0",
         "-nographic",
     };
     const run_cmd = b.addSystemCommand(&qemu_argv);

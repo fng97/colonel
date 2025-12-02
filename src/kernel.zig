@@ -77,6 +77,13 @@ fn main() !void {
     log.debug("Setting trap handler: {*}\n", .{&kernel_entry});
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
+    virtio_blk_init();
+    var buf: [sector_size]u8 = undefined;
+    read_write_disk(&buf, 0, false);
+    log.info("first sector: {s}\n", .{buf});
+    @memcpy(buf[0..21], "hello from kernel!!!\n");
+    read_write_disk(&buf, 0, true);
+
     log.info("Creating idle process\n", .{});
     process_idle = create_process(undefined);
     process_current = process_idle;
@@ -382,14 +389,14 @@ export fn handle_trap(trap_frame: *TrapFrame) void {
     );
 }
 
-/// Read control and status register (CSR)
+/// Read control and status register (CSR).
 fn read_csr(comptime register: []const u8) usize {
     return asm volatile ("csrr %[ret], " ++ register
         : [ret] "=r" (-> usize),
     );
 }
 
-/// Write control and status register (CSR)
+/// Write control and status register (CSR).
 fn write_csr(comptime register: []const u8, val: usize) void {
     asm volatile ("csrw " ++ register ++ ", %[val]"
         :
@@ -497,6 +504,14 @@ fn create_process(image: []const u8) *Process {
     log.debug("Mapping kernel pages: {f}\n", .{flags});
     while (paddr < @intFromPtr(&ram_end[0])) : (paddr += page_size_bytes)
         map_page(page_directory, paddr, paddr, flags);
+
+    // Map virtio-blk MMIO region.
+    map_page(page_directory, virtio_blk_paddr, virtio_blk_paddr, .{
+        .readable = true,
+        .writable = true,
+        .executable = false,
+        .user = false,
+    });
 
     // Map user pages.
     var pos: usize = 0;
@@ -699,8 +714,8 @@ const PageTableEntry = packed struct(u32) {
     /// on page directory entries.
     fn page_table(pte: PageTableEntry) *[page_table_size]PageTableEntry {
         // The page number must be widened from u22 to u32 to prevent overflow.
-        // const page_number: u32 = pte.ppn;
-        return @ptrFromInt(pte.ppn * page_size_bytes);
+        const page_number: u32 = pte.ppn;
+        return @ptrFromInt(page_number * page_size_bytes);
     }
 };
 
@@ -787,4 +802,260 @@ fn user_entry() callconv(.naked) void {
         : [sepc] "r" (user_base),
           [sstatus] "r" (sstatus_spie),
     );
+}
+
+// DISK I/O
+
+const sector_size = 512;
+const virtq_entry_num = 16;
+const virtio_device_blk = 2;
+const virtio_blk_paddr = 0x10001000;
+const virtio_reg_magic = 0x00;
+const virtio_reg_version = 0x04;
+const virtio_reg_device_id = 0x08;
+const virtio_reg_queue_sel = 0x30;
+const virtio_reg_queue_num_max = 0x34;
+const virtio_reg_queue_num = 0x38;
+const virtio_reg_queue_align = 0x3c;
+const virtio_reg_queue_pfn = 0x40;
+const virtio_reg_queue_ready = 0x44;
+const virtio_reg_queue_notify = 0x50;
+const virtio_reg_device_status = 0x70;
+const virtio_reg_device_config = 0x100;
+const virtio_status_ack = 1;
+const virtio_status_driver = 2;
+const virtio_status_driver_ok = 4;
+const virtio_status_feat_ok = 8;
+const virtq_desc_f_next = 1;
+const virtq_desc_f_write = 2;
+const virtq_avail_f_no_interrupt = 1;
+const virtio_blk_t_in = 0;
+const virtio_blk_t_out = 1;
+
+/// Virtqueue Descriptor area entry (2.6.5).
+///
+/// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-320005
+const virtq_desc = extern struct {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+};
+
+/// Virtqueue Available Ring (2.6.6).
+///
+/// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-380006
+const virtq_avail = extern struct {
+    flags: u16,
+    index: u16,
+    ring: [virtq_entry_num]u16,
+};
+
+/// Virtqueue Used Ring (2.6.8).
+///
+/// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-430008
+const virtq_used = extern struct {
+    flags: u16,
+    index: u16,
+    ring: [virtq_entry_num]virtq_used_elem,
+};
+
+/// Virtqueue Used Ring entry (2.6.8).
+///
+/// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-430008
+const virtq_used_elem = extern struct {
+    id: u32,
+    len: u32,
+};
+
+/// Virtqueue.
+const virtio_virtq = struct {
+    descs: [virtq_entry_num]virtq_desc,
+    avail: virtq_avail,
+    used: virtq_used align(page_size_bytes),
+    queue_index: i32,
+    used_index: *volatile u16,
+    last_used_index: u16,
+};
+
+/// Virtio-blk request (5.2.6).
+///
+/// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2500006
+const virtio_blk_req = extern struct {
+    // First descriptor: read-only from the device
+    type: u32,
+    reserved: u32,
+    sector: u64,
+    // Second descriptor: writable by the device if it's a read operation (VIRTQ_DESC_F_WRITE)
+    data: [512]u8,
+    // Third descriptor: writable by the device (VIRTQ_DESC_F_WRITE)
+    status: u8,
+};
+
+fn reg_32_ptr(offset: u32) *volatile u32 {
+    const addr = virtio_blk_paddr + @as(usize, offset);
+    return @ptrFromInt(addr);
+}
+
+fn reg_64_ptr(offset: u32) *volatile u64 {
+    const addr = virtio_blk_paddr + @as(usize, offset);
+    return @ptrFromInt(addr);
+}
+
+fn virtio_reg_32_read(offset: u32) u32 {
+    return reg_32_ptr(offset).*; // volatile load
+}
+
+fn virtio_reg_64_read(offset: u32) u64 {
+    return reg_64_ptr(offset).*; // volatile load
+}
+
+fn virtio_reg_32_write(offset: u32, value: u32) void {
+    reg_32_ptr(offset).* = value; // volatile store
+}
+
+fn virtio_reg_32_fetch_and_or(offset: u32, value: u32) void {
+    // FIXME: Same read-modify-write semantics as the C version (not atomic).
+    virtio_reg_32_write(offset, virtio_reg_32_read(offset) | value);
+}
+
+var blk_request_vq: *virtio_virtq = undefined;
+var blk_req: *virtio_blk_req = undefined;
+var blk_req_paddr: usize = undefined;
+var blk_capacity: u64 = undefined;
+
+fn virtio_blk_init() void {
+    if (virtio_reg_32_read(virtio_reg_magic) != 0x74726976)
+        @panic("virtio: invalid magic value");
+    if (virtio_reg_32_read(virtio_reg_version) != 1)
+        @panic("virtio: invalid version");
+    if (virtio_reg_32_read(virtio_reg_device_id) != virtio_device_blk)
+        @panic("virtio: invalid device id");
+
+    // 1. Reset the device.
+    virtio_reg_32_write(virtio_reg_device_status, 0);
+    // 2. Set the ACKNOWLEDGE status bit: the guest OS has noticed the device.
+    virtio_reg_32_fetch_and_or(virtio_reg_device_status, virtio_status_ack);
+    // 3. Set the DRIVER status bit.
+    virtio_reg_32_fetch_and_or(virtio_reg_device_status, virtio_status_driver);
+    // 5. Set the FEATURES_OK status bit.
+    virtio_reg_32_fetch_and_or(virtio_reg_device_status, virtio_status_feat_ok);
+    // 7. Perform device-specific setup, including discovery of virtqueues for the device
+    blk_request_vq = virtq_init(0);
+    // 8. Set the DRIVER_OK status bit.
+    virtio_reg_32_write(virtio_reg_device_status, virtio_status_driver_ok);
+
+    // Get the disk capacity.
+    blk_capacity = virtio_reg_64_read(virtio_reg_device_config + 0) * sector_size;
+    // printf("virtio-blk: capacity is %d bytes\n", (int)blk_capacity);
+
+    // Allocate a region to store requests to the device.
+    std.debug.assert(@sizeOf(virtio_blk_req) <= page_size_bytes);
+    blk_req_paddr = @intFromPtr(alloc_pages(1).ptr);
+    blk_req = @ptrFromInt(blk_req_paddr);
+}
+
+fn virtq_init(index: u32) *virtio_virtq {
+    // Allocate a region for the virtqueue.
+    std.debug.assert(@sizeOf(virtio_virtq) <= page_size_bytes);
+    const virtq_paddr: usize = @intFromPtr(alloc_pages(1).ptr);
+    const vq: *virtio_virtq = @ptrFromInt(virtq_paddr);
+    vq.queue_index = @intCast(index);
+    vq.used_index = &vq.used.index;
+    // 1. Select the queue writing its index (first queue is 0) to QueueSel.
+    virtio_reg_32_write(virtio_reg_queue_sel, index);
+    // 5. Notify the device about the queue size by writing the size to QueueNum.
+    virtio_reg_32_write(virtio_reg_queue_num, virtq_entry_num);
+    // 6. Notify the device about the used alignment by writing its value in bytes to QueueAlign.
+    virtio_reg_32_write(virtio_reg_queue_align, 0);
+    // 7. Write the physical number of the first page of the queue to the QueuePFN register.
+    virtio_reg_32_write(virtio_reg_queue_pfn, virtq_paddr);
+    return vq;
+}
+
+/// Notifies the device that there is a new request. `desc_index` is the index of the head
+/// descriptor of the new request.
+fn virtq_kick(vq: *virtio_virtq, desc_index: u16) void {
+    // Put head descriptor index into the available ring.
+    const ring_index: usize = @as(usize, @intCast(vq.avail.index % virtq_entry_num));
+    vq.avail.ring[ring_index] = desc_index;
+    vq.avail.index +%= 1; // wrap around u16
+
+    // TODO: There was a __sync_synchronize() here.
+
+    // Notify device about this queue.
+    virtio_reg_32_write(virtio_reg_queue_notify, @as(u32, @intCast(vq.queue_index)));
+
+    // Track the last used index we’re expecting the device to catch up to.
+    vq.last_used_index +%= 1;
+}
+
+// Returns whether there are requests being processed by the device.
+fn virtq_is_busy(vq: *virtio_virtq) bool {
+    // If the device's used index hasn't reached our last_used_index, there is still a request in
+    // flight.
+    return vq.last_used_index != vq.used_index.*;
+}
+
+// Reads/writes one sector from/to virtio-blk device.
+fn read_write_disk(buf: [*]u8, sector: u32, is_write: bool) void {
+    const max_sector = blk_capacity / sector_size;
+
+    if (sector >= @as(u32, @intCast(max_sector))) {
+        log.err(
+            "virtio: tried to read/write sector={d}, but capacity is {d}\n",
+            .{ sector, max_sector },
+        );
+        return;
+    }
+
+    // Construct the request according to the virtio-blk specification.
+    blk_req.sector = sector;
+    blk_req.type = if (is_write) virtio_blk_t_out else virtio_blk_t_in;
+
+    if (is_write) {
+        // Copy data from caller buffer into request.
+        @memcpy(blk_req.data[0..sector_size], buf[0..sector_size]);
+    }
+
+    // Construct the virtqueue descriptors (using 3 descriptors).
+    const vq = blk_request_vq;
+
+    // Descriptor 0: request header (type, reserved, sector).
+    vq.descs[0].addr = @as(u64, blk_req_paddr);
+    vq.descs[0].len = @as(u32, @intCast(@sizeOf(u32) * 2 + @sizeOf(u64)));
+    vq.descs[0].flags = virtq_desc_f_next;
+    vq.descs[0].next = 1;
+
+    // Descriptor 1: data buffer.
+    vq.descs[1].addr = @as(u64, blk_req_paddr + @offsetOf(virtio_blk_req, "data"));
+    vq.descs[1].len = @as(u32, sector_size);
+    vq.descs[1].flags = virtq_desc_f_next |
+        (if (is_write) @as(u16, 0) else virtq_desc_f_write);
+    vq.descs[1].next = 2;
+
+    // Descriptor 2: status byte.
+    vq.descs[2].addr = @as(u64, blk_req_paddr + @offsetOf(virtio_blk_req, "status"));
+    vq.descs[2].len = @as(u32, @intCast(@sizeOf(u8)));
+    vq.descs[2].flags = virtq_desc_f_write;
+
+    // Notify the device that there is a new request.
+    virtq_kick(vq, 0);
+
+    // Wait until the device finishes processing.
+    while (virtq_is_busy(vq)) {}
+
+    // virtio-blk: If a non-zero value is returned, it's an error.
+    if (blk_req.status != 0) {
+        log.err(
+            "virtio: warn: failed to read/write sector={} status={}\n",
+            .{ sector, blk_req.status },
+        );
+        return;
+    }
+
+    // For read operations, copy the data into the buffer.
+    if (!is_write) {
+        @memcpy(buf[0..sector_size], blk_req.data[0..sector_size]);
+    }
 }
